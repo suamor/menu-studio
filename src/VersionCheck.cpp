@@ -54,6 +54,10 @@ namespace {
     bool           g_criticalOk{ false };
     std::ptrdiff_t g_dispatchCall{ 0 };
     std::ptrdiff_t g_smootherCall{ 0 };
+    std::ptrdiff_t g_collisionTestCall{ 0 };
+    std::ptrdiff_t g_cameraPlayerCall{ 0 };
+    std::ptrdiff_t g_cameraMasterCall{ 0 };
+    std::ptrdiff_t g_inputPumpCall{ 0 };
 
     // Every id in this version's Address Library, for exact-membership tests.
     //
@@ -156,7 +160,7 @@ namespace {
             return { found, "located by scan" };
         }
         if (hits > 1) {
-            spdlog::error("  call site: {} calls to the target inside the function - ambiguous, "
+            spdlog::error("  call site: {} calls to the target inside the function, ambiguous, "
                           "refusing to guess.", hits);
             return {};
         }
@@ -187,7 +191,7 @@ namespace {
         if (a_hint != 0 && HintIsHandMeasured() &&
             a_start + static_cast<std::uintptr_t>(a_hint) + 5 < textHi &&
             *reinterpret_cast<const std::uint8_t*>(a_start + a_hint) == 0xE8) {
-            return { a_hint, "hand-measured offset, ALREADY HOOKED by another mod - chaining" };
+            return { a_hint, "hand-measured offset, ALREADY HOOKED by another mod, chaining" };
         }
         return {};
     }
@@ -217,9 +221,19 @@ namespace {
         { "FaceGenApplyMorphs",            MTB::Offsets::FaceGenApplyMorphs,     Kind::kCode },
         { "3rd-person position builder",   MTB::Offsets::CameraPositionBuilder,  Kind::kCode },
         { "camera collision smoother",     MTB::Offsets::CameraCollisionSmoother, Kind::kCode },
+        { "camera obstruction query",      MTB::Offsets::CameraCollisionTest,     Kind::kCode },
+        { "TESCamera::Update (base body)", MTB::Offsets::TESCameraUpdateBase,     Kind::kCode },
+        { "player update camera caller",   MTB::Offsets::PlayerUpdateCameraCaller, Kind::kCode },
+        { "PlayerCamera master update",    MTB::Offsets::PlayerCameraMasterUpdate, Kind::kCode },
+        { "input pump (FLICK-shared site)", MTB::Offsets::InputPumpCaller,         Kind::kCode },
+        { "input pump dispatch",           MTB::Offsets::InputPumpDispatch,       Kind::kCode },
+        { "Inventory3D UpdateMagic3D",      MTB::Offsets::Inventory3DUpdateMagic,  Kind::kCode },
+        { "Inventory3D model appender",     MTB::Offsets::Inventory3DAppendModel,  Kind::kCode },
+        { "UIMessageQueue::AddMessage",    MTB::Offsets::UIMessageQueueAddMessage, Kind::kCode },
         { "NiPointLight create",           MTB::Offsets::NiPointLightCreate,     Kind::kCode },
         { "ShadowSceneNode::AddLight",     MTB::Offsets::ShadowSceneAddLight,    Kind::kCode },
         { "ShadowSceneNode::RemoveLight",  MTB::Offsets::ShadowSceneRemoveLight, Kind::kCode },
+        { "BSShaderManager::State",        MTB::Offsets::ShaderManagerState,     Kind::kData },
         { "Sky interior-light refresh",    MTB::Offsets::SkyForceInteriorRefresh, Kind::kCode },
         { "TESWaterSystem singleton",      MTB::Offsets::TESWaterSystemSingleton, Kind::kData },
         { "BSModelDB::Demand",             MTB::Offsets::BSModelDBDemand,        Kind::kCode },
@@ -251,7 +265,7 @@ namespace {
             return false;
         }
         if (!MTB::VersionCheck::IdOk(id)) {
-            spdlog::error("  {:<32} id {} ABSENT from this build's Address Library - the feature "
+            spdlog::error("  {:<32} id {} ABSENT from this build's Address Library: the feature "
                           "using it is OFF (resolving it anyway would hand back a neighbouring "
                           "function).", a_entry.name, id);
             return false;
@@ -296,6 +310,22 @@ namespace MTB::VersionCheck {
         return g_smootherCall;
     }
 
+    std::ptrdiff_t CollisionTestCallOffset() {
+        return g_collisionTestCall;
+    }
+
+    std::ptrdiff_t CameraPlayerCallOffset() {
+        return g_cameraPlayerCall;
+    }
+
+    std::ptrdiff_t CameraMasterCallOffset() {
+        return g_cameraMasterCall;
+    }
+
+    std::ptrdiff_t InputPumpCallOffset() {
+        return g_inputPumpCall;
+    }
+
     void Run() {
         if (g_ran) {
             return;
@@ -338,8 +368,9 @@ namespace MTB::VersionCheck {
         }
         g_criticalOk = g_dispatchCall != 0;
 
-        // The camera-collision bypass. Optional: AE inlined the smoother, so
-        // absence here is the documented AE limitation, not an error.
+        // The camera-collision bypass. SE exposes the full smoother as a call;
+        // AE inlines that body but retains one call to its obstruction query.
+        // Locate whichever verified seam this runtime provides.
         const auto smoother =
             (IdOk(Offsets::CameraPositionBuilder) && IdOk(Offsets::CameraCollisionSmoother))
                 ? LocateCall(Offsets::CameraPositionBuilder.address(),
@@ -349,10 +380,75 @@ namespace MTB::VersionCheck {
         g_smootherCall = smoother.offset;
         if (g_smootherCall != 0) {
             spdlog::info("  camera collision: position-builder+0x{:X} ({}).", g_smootherCall,
-                         smoother.how);
+                          smoother.how);
         } else {
-            spdlog::info("  camera collision: no standalone smoother call on this runtime "
-                         "(AE inlines it); bypass unavailable, everything else works.");
+            const auto collisionTest =
+                (IdOk(Offsets::CameraPositionBuilder) &&
+                 IdOk(Offsets::CameraCollisionTest))
+                    ? LocateCall(Offsets::CameraPositionBuilder.address(),
+                                 Offsets::CameraCollisionTest.address(),
+                                 Offsets::CollisionTestCallOffsetHint())
+                    : Located{};
+            g_collisionTestCall = collisionTest.offset;
+            if (g_collisionTestCall != 0) {
+                spdlog::info(
+                    "  camera collision: inline obstruction query at "
+                    "position-builder+0x{:X} ({}).",
+                    g_collisionTestCall, collisionTest.how);
+            } else {
+                spdlog::info(
+                    "  camera collision: no verified smoother or inline "
+                    "obstruction-query call; bypass unavailable.");
+            }
+        }
+
+        // The input tap's site. ⚠ EXPECTED TO BE ALREADY HOOKED in this load
+        // order: FLICK write_calls the same E8, so the target-match fails and
+        // the hand-measured-offset chaining case is the one that fires. That
+        // is the desired outcome, not a compromise - chaining OUTSIDE FLICK's
+        // thunk is the entire point of the tap.
+        const auto inputPump =
+            (IdOk(Offsets::InputPumpCaller) && IdOk(Offsets::InputPumpDispatch))
+                ? LocateCall(Offsets::InputPumpCaller.address(),
+                             Offsets::InputPumpDispatch.address(),
+                             Offsets::InputPumpCallOffsetHint())
+                : Located{};
+        g_inputPumpCall = inputPump.offset;
+        if (g_inputPumpCall != 0) {
+            spdlog::info("  input tap: pump+0x{:X} ({}).", g_inputPumpCall, inputPump.how);
+        } else {
+            spdlog::info("  input tap: no verified pump call site; the camera "
+                         "falls back to the event sink (gestures FLICK swallows "
+                         "stay swallowed).");
+        }
+
+        // The studio camera's devirtualized TESCamera::Update call sites.
+        // AE-only by construction (SE's callers all go through the vtable,
+        // where the write_vfunc already sits); the container ids are 0 on SE,
+        // so LocateCall declines there without a special case.
+        const auto camPlayer =
+            (IdOk(Offsets::PlayerUpdateCameraCaller) && IdOk(Offsets::TESCameraUpdateBase))
+                ? LocateCall(Offsets::PlayerUpdateCameraCaller.address(),
+                             Offsets::TESCameraUpdateBase.address(),
+                             Offsets::CameraPlayerCallOffsetHint())
+                : Located{};
+        g_cameraPlayerCall = camPlayer.offset;
+        const auto camMaster =
+            (IdOk(Offsets::PlayerCameraMasterUpdate) && IdOk(Offsets::TESCameraUpdateBase))
+                ? LocateCall(Offsets::PlayerCameraMasterUpdate.address(),
+                             Offsets::TESCameraUpdateBase.address(),
+                             Offsets::CameraMasterCallOffsetHint())
+                : Located{};
+        g_cameraMasterCall = camMaster.offset;
+        if (g_cameraPlayerCall != 0 || g_cameraMasterCall != 0) {
+            spdlog::info("  camera re-assert: direct TESCamera::Update calls at "
+                         "player-update+0x{:X} ({}) and master-update+0x{:X} ({}).",
+                         g_cameraPlayerCall, camPlayer.how, g_cameraMasterCall,
+                         camMaster.how);
+        } else {
+            spdlog::info("  camera re-assert: no devirtualized TESCamera::Update "
+                         "call sites on this runtime (expected on SE; the vtable "
+                         "hook is the whole path there).");
         }
 
         spdlog::info("--- self-check {} ---", g_criticalOk ? "PASSED" : "FAILED");

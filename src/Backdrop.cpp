@@ -2,6 +2,10 @@
 
 #include "Backdrop.h"
 
+#include "BackdropAnchorPolicy.h"
+#include "BackdropImage.h"
+#include "BackdropImagePolicy.h"
+#include "CsCubemapBridge.h"
 #include "Offsets.h"
 #include "Settings.h"
 #include "Transition.h"
@@ -9,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -62,6 +67,7 @@ namespace {
     struct PieceDef {
         std::string name;
         std::string mesh;
+        std::string image;              // non-empty: repoint the image sphere to this DDS
         float       fitRadius{ 0.0f };  // >0: scale bound radius to this
         float       scale{ 1.0f };      // used when fitRadius == 0
         float       x{ 0.0f }, y{ 0.0f }, z{ 0.0f };
@@ -72,11 +78,41 @@ namespace {
         bool        exactTint{ false }; // F-7 v3: write the tint color as-is
     };
 
+    // The image repoint's save/restore record, one per repointed geometry.
+    // Same SPEC §4 invariant as TintBackup and for the same reason: the clone
+    // SHARES its shader property and material with the cached template, so an
+    // un-restored write would ride every later demand of the mesh. The backup
+    // holds a strong ref on the original texture - overwriting the material's
+    // NiPointer drops its ref, and the original must still be alive when the
+    // restore puts it back.
+    struct ImageBackup {
+        RE::NiPointer<RE::BSGeometry>      geom;
+        RE::NiPointer<RE::NiSourceTexture> tex;
+        RE::BSFixedString                  path;
+        float                              baseColorScale{ 1.0f };
+    };
+
+    // The last shader values this piece was logged writing. Bubble hunt
+    // 2026-08-27: the arm line already says the dome came up with its image,
+    // and the field round proved it did on the arm that then went strange, so
+    // the fault is in what gets pushed at the pieces AFTER they are up. None
+    // of the three writers logged a value, which left "the backdrop went grey"
+    // with no reading behind it. Sentinel below any real value so the first
+    // push after an arm always prints one.
+    struct ShaderValues {
+        float r{ -1.0f }, g{ -1.0f }, b{ -1.0f };
+        float brightness{ -1.0f };
+        float imageBrightness{ -1.0f };
+        float fade{ -1.0f };
+    };
+
     struct Piece {
         PieceDef                      def;
         RE::NiPointer<RE::NiAVObject> node;
         std::vector<TintBackup>       tints;
+        std::vector<ImageBackup>      images;
         float                         unitRadius{ 0.0f };  // bound radius at scale 1
+        ShaderValues                  logged;
     };
     std::vector<Piece> g_active;
     std::string   g_appliedStage;
@@ -84,6 +120,14 @@ namespace {
     int           g_appliedMode = 0;
     bool          g_up = false;
     bool          g_attemptedThisArm = false;  // no per-tick retry storm on bad paths
+    bool          g_settleLoggedThisArm = false;
+    // Budget for the value trace above, spent per arm. Refresh runs every tick,
+    // so an ungated line would be a flood and a per-arm-once line would miss
+    // the change it exists to catch. On movement, capped, is the shape that
+    // answers "what did the values do while it was up" in a readable number of
+    // lines.
+    unsigned      g_shaderValueLines = 0;
+    unsigned      g_settleRefitTicksRemaining = 0;
     std::uint32_t g_fitRevision = 0;
 
     // Persistent gap occluder (RE Option P). Held resident across menus so its
@@ -130,8 +174,11 @@ namespace {
         return ToNi(a_look.fill);
     }
 
-    void PushTint(Piece& a_piece, const MTB::Settings::LookValues& a_look,
-                  float a_brightness) {
+    // Returns the colour it wrote, so the value trace can report what actually
+    // landed rather than recomputing PieceTint and the picker override beside
+    // it and drifting from them.
+    RE::NiColor PushTint(Piece& a_piece, const MTB::Settings::LookValues& a_look,
+                         float a_brightness) {
         // r47: the color picker drives the WHOLE void - the dome takes the
         // picked color through the hue-transfer (its texture keeps its
         // authored luminance), the shell takes it verbatim below. Off =
@@ -190,6 +237,77 @@ namespace {
                     material->baseColorScale = backup.baseColorScale * a_brightness;
                 }
             }
+        }
+        return tint;
+    }
+
+    // The value trace itself. Prints only when something MOVED, so a healthy
+    // arm costs one line per piece and a backdrop that goes grey while it is up
+    // prints the moment it does, with the reading that says which of the three
+    // writers moved it.
+    //
+    // ⚠ THE TRANSITION RAMP IS NOT A FINDING. t runs 0 to 1 at every arm and
+    // multiplies both brightnesses, so logging during the ramp would print the
+    // same expected climb every time and bury the one line that matters. The
+    // trace waits for t to settle.
+    // ⚠⚠ a_tinted IS NOT OPTIONAL AND ITS ABSENCE WAS THE TRACE'S FIRST BUG.
+    // The ARM site calls PushTint on every piece; Refresh and PushFade call it
+    // only when def.tint. The first cut of this reported the skipped case as a
+    // real colour, so the dome printed a healthy tint at the arm and then
+    // "(MOVED) tint (0.000,0.000,0.000) brightness 0.000" in the SAME
+    // millisecond, on every arm, which reads exactly like the backdrop going
+    // black and is nothing of the kind (field 2026-08-27, 04:45:51 and twice
+    // more). An untinted piece now says so and its colour fields do not take
+    // part in the movement test at all.
+    //
+    // ⚠ THE DOME IS THE UNTINTED ONE HERE, and its arm line says why:
+    // '0 tintable geom(s)'. So PushTint has nothing to write on it either way
+    // and the two call sites disagreeing is harmless today. It is still a real
+    // inconsistency and worth closing separately.
+    void LogShaderValues(Piece& a_piece, const RE::NiColor& a_tint, bool a_tinted,
+                         float a_brightness, float a_imageBrightness, float a_fade) {
+        constexpr float kEps      = 0.01f;
+        constexpr unsigned kBudget = 40;
+        if (a_fade < 0.999f) {
+            return;  // still ramping in or dissolving out; expected motion
+        }
+        const auto moved = [](float a_was, float a_now) {
+            return a_was < 0.0f || std::fabs(a_was - a_now) > kEps;
+        };
+        auto& was = a_piece.logged;
+        const bool colourMoved = a_tinted && (moved(was.r, a_tint.red) ||
+                                              moved(was.g, a_tint.green) ||
+                                              moved(was.b, a_tint.blue) ||
+                                              moved(was.brightness, a_brightness));
+        if (!colourMoved && !moved(was.imageBrightness, a_imageBrightness) &&
+            !moved(was.fade, a_fade)) {
+            return;
+        }
+        const bool first = was.imageBrightness < 0.0f;
+        if (a_tinted) {  // an untinted pass leaves the colour record alone
+            was.r          = a_tint.red;
+            was.g          = a_tint.green;
+            was.b          = a_tint.blue;
+            was.brightness = a_brightness;
+        }
+        was.imageBrightness = a_imageBrightness;
+        was.fade            = a_fade;
+        if (g_shaderValueLines >= kBudget) {
+            return;  // the budget is spent; the lines already printed carry the shape
+        }
+        ++g_shaderValueLines;
+        if (a_tinted) {
+            spdlog::info("backdrop values: '{}' tint ({:.3f},{:.3f},{:.3f}) brightness {:.3f} "
+                         "image brightness {:.3f} fade {:.3f}{}{}",
+                         a_piece.def.name, a_tint.red, a_tint.green, a_tint.blue, a_brightness,
+                         a_imageBrightness, a_fade, first ? " (settled)" : " (MOVED)",
+                         g_shaderValueLines == kBudget ? " [budget spent]" : "");
+        } else {
+            spdlog::info("backdrop values: '{}' untinted (def.tint off, nothing to write) "
+                         "image brightness {:.3f} fade {:.3f}{}{}",
+                         a_piece.def.name, a_imageBrightness, a_fade,
+                         first ? " (settled)" : " (MOVED)",
+                         g_shaderValueLines == kBudget ? " [budget spent]" : "");
         }
     }
 
@@ -292,8 +410,146 @@ namespace {
                 }
                 return RE::BSVisit::BSVisitControl::kContinue;
             });
-        spdlog::debug("backdrop: '{}' shaders - {} lighting, {} effect, {} other.",
+        spdlog::debug("backdrop: '{}' shaders: {} lighting, {} effect, {} other.",
                       a_piece.def.name, lightingCount, effectCount, otherCount);
+    }
+
+    // The image-pack repoint: point the image sphere's effect material at the
+    // pack's DDS. Runs on the CLONE at Apply, but the material is SHARED with
+    // the cached template (the TintBackup lesson), so this is a save/restore
+    // write, not a material swap - FR's SetMaterial idiom would run the
+    // shared material through the cache's release and contaminate the
+    // template for every later arm. The piece is untinted (r58), so nothing
+    // else writes these fields between Apply and Remove.
+    void ApplyImage(Piece& a_piece) {
+        const std::string rooted = MTB::BackdropImagePolicy::Rooted(a_piece.def.image);
+        LARGE_INTEGER t0{}, t1{};
+        ::QueryPerformanceCounter(&t0);
+        auto tex = MTB::BackdropImage::Load(rooted);
+        ::QueryPerformanceCounter(&t1);
+        if (!tex) {
+            spdlog::warn("backdrop: image '{}' did not load. '{}' keeps the shipped "
+                         "texture.", rooted, a_piece.def.name);
+            return;
+        }
+        int repointed = 0;
+        RE::BSVisit::TraverseScenegraphGeometries(
+            a_piece.node.get(), [&](RE::BSGeometry* a_geom) {
+                auto* prop = a_geom->GetGeometryRuntimeData()
+                                 .properties[RE::BSGeometry::States::kEffect]
+                                 .get();
+                auto* effect = netimmerse_cast<RE::BSEffectShaderProperty*>(prop);
+                auto* material = effect ? static_cast<RE::BSEffectShaderMaterial*>(
+                                              effect->material)
+                                        : nullptr;
+                if (!material) {
+                    return RE::BSVisit::BSVisitControl::kContinue;
+                }
+                ImageBackup backup;
+                backup.geom = RE::NiPointer<RE::BSGeometry>{ a_geom };
+                backup.tex = material->sourceTexture;  // strong ref, outlives the write
+                backup.path = material->sourceTexturePath;
+                backup.baseColorScale = material->baseColorScale;
+                a_piece.images.push_back(std::move(backup));
+                material->sourceTexture = tex;
+                material->sourceTexturePath = rooted.c_str();
+                // The pass list caches on the (shared) property; stale passes
+                // from an earlier arm would keep sampling the old texture.
+                effect->DoClearRenderPasses();
+                ++repointed;
+                return RE::BSVisit::BSVisitControl::kContinue;
+            });
+        // ⚠ A missing file is NOT a null: the engine substitutes a live
+        // placeholder texture. The loose-file check below is the only tell,
+        // and it is blind to archives - a BSA-shipped pack logs "not loose"
+        // and still renders fine, so the note stays a hint, not a verdict.
+        std::error_code ec;
+        const bool onDisk = std::filesystem::exists(rooted, ec);
+        spdlog::info("backdrop: '{}' image -> '{}' (load {:.1f} ms, {} geom(s){}).",
+                     a_piece.def.name, rooted, QpcMs(t0.QuadPart, t1.QuadPart), repointed,
+                     onDisk ? "" : "; not a loose file: if no archive carries it, "
+                                   "the engine shows a flat placeholder");
+        if (repointed == 0) {
+            spdlog::warn("backdrop: image '{}' loaded but '{}' has no effect-shader "
+                         "geometry to repoint. Is the mesh voidimage.nif?",
+                         rooted, a_piece.def.name);
+        }
+
+        // Reflections: hand CS the pack's pre-baked cubemap sibling so armor
+        // reflects the image instead of the screen-space capture's stale
+        // history. Loose-file check is honest here - CS reads the file from
+        // disk itself, so an archived cubemap genuinely does not work.
+        const std::string cube = MTB::BackdropImagePolicy::CubeSibling(rooted);
+        std::error_code cubeEc;
+        if (!cube.empty() && std::filesystem::exists(cube, cubeEc)) {
+            if (MTB::CsCubemapBridge::Push(cube)) {
+                spdlog::info("backdrop: reflections follow the image ('{}').", cube);
+            }
+        } else if (MTB::CsCubemapBridge::Available()) {
+            spdlog::info("backdrop: no cubemap sibling ('{}'). Reflections keep CS's "
+                         "capture. Re-run the pack pipeline to bake one.", cube);
+        }
+
+        // Atmosphere: CS's exponential height fog integrates over the
+        // sphere's ~800 units and reads as a grey veil on the picture
+        // (field: "washed out", brightness could not cancel it). The image
+        // replaces the distant world, so the studio range is excluded from
+        // the fog while it is up.
+        if (MTB::CsCubemapBridge::SetFogFloor(100000.0f)) {
+            spdlog::info("backdrop: height fog excluded over the studio while the "
+                         "image is up.");
+        }
+    }
+
+    void RestoreImage(Piece& a_piece) {
+        for (auto& backup : a_piece.images) {
+            auto* geom = backup.geom.get();
+            if (!geom) {
+                continue;
+            }
+            auto* prop = geom->GetGeometryRuntimeData()
+                             .properties[RE::BSGeometry::States::kEffect]
+                             .get();
+            auto* effect = netimmerse_cast<RE::BSEffectShaderProperty*>(prop);
+            auto* material =
+                effect ? static_cast<RE::BSEffectShaderMaterial*>(effect->material) : nullptr;
+            if (!material) {
+                continue;
+            }
+            material->sourceTexture = backup.tex;
+            material->sourceTexturePath = backup.path;
+            material->baseColorScale = backup.baseColorScale;
+            effect->DoClearRenderPasses();
+        }
+        if (!a_piece.images.empty()) {
+            MTB::CsCubemapBridge::Clear();         // reflections return to CS's capture
+            MTB::CsCubemapBridge::ClearFogFloor(); // atmosphere returns with the world
+        }
+        a_piece.images.clear();
+    }
+
+    // The image sphere's own brightness, dialed live from the panel (field
+    // 2026-08-20: an as-authored daylight image blows out white over the dark
+    // studio - the nebula the void was tuned for sits at 0.02-0.16 luminance
+    // and ENB effect gain rides on top). Value writes on the shared material
+    // are live per pass, the same way PushTint's are; RestoreImage puts the
+    // authored scale back.
+    void PushImageBrightness(Piece& a_piece, float a_brightness) {
+        for (auto& backup : a_piece.images) {
+            auto* geom = backup.geom.get();
+            if (!geom) {
+                continue;
+            }
+            auto* effect = netimmerse_cast<RE::BSEffectShaderProperty*>(
+                geom->GetGeometryRuntimeData()
+                    .properties[RE::BSGeometry::States::kEffect]
+                    .get());
+            auto* material =
+                effect ? static_cast<RE::BSEffectShaderMaterial*>(effect->material) : nullptr;
+            if (material) {
+                material->baseColorScale = a_brightness;
+            }
+        }
     }
 
     // r57 custom-image composition: the world yaw (degrees) that points a
@@ -377,7 +633,15 @@ namespace {
             dome.z = a_cfg.backdropDomeZ;
             // r58: the custom-image sphere (voidimage.nif) shows AS AUTHORED -
             // the dark void tint would black it out; vanilla domes tint as before.
-            dome.tint = a_cfg.backdropDomeMesh.find("voidimage") == std::string::npos;
+            const bool imageSphere =
+                a_cfg.backdropDomeMesh.find("voidimage") != std::string::npos;
+            dome.tint = !imageSphere;
+            // Image packs: the pack's DDS replaces the sphere's shipped texture
+            // at Apply. Keyed on the same mesh test as the tint carve-out so a
+            // stale image path can never touch a vanilla dome.
+            if (imageSphere) {
+                dome.image = a_cfg.backdropBackgroundImage;
+            }
             // r59: the flat void-colour sphere (blank) takes the void colour
             // EXACTLY (like the shell), not the capped fog/ambient hue-transfer.
             dome.exactTint = a_cfg.backdropDomeMesh.find("voidcolor") != std::string::npos;
@@ -463,7 +727,7 @@ namespace MTB::Backdrop {
         auto* playerRoot = player->Get3D(false);
         auto* parent = playerRoot ? playerRoot->parent : nullptr;
         if (!parent) {
-            spdlog::warn("backdrop: no scene parent - skipped.");
+            spdlog::warn("backdrop: no scene parent, skipped.");
             return;
         }
 
@@ -472,6 +736,9 @@ namespace MTB::Backdrop {
         auto defs = BuildDefs(cfg);
         g_active.clear();
         g_active.reserve(defs.size());
+        g_settleLoggedThisArm = false;
+        g_settleRefitTicksRemaining =
+            MTB::BackdropAnchorPolicy::kSettledRefitFrames;
         int up = 0;
 
         for (auto& def : defs) {
@@ -482,14 +749,14 @@ namespace MTB::Backdrop {
             const auto code = g_demandModel(def.mesh.c_str(), model, args);
             ::QueryPerformanceCounter(&t1);
             if (code != 0 || !model) {
-                spdlog::warn("backdrop: demand failed for '{}' (error {}) - piece skipped. "
+                spdlog::warn("backdrop: demand failed for '{}' (error {}). Piece skipped. "
                              "Check the stage's mesh path.", def.mesh, code);
                 continue;
             }
 
             auto* clone = g_niClone(model.get());
             if (!clone) {
-                spdlog::warn("backdrop: clone failed for '{}' - piece skipped.", def.mesh);
+                spdlog::warn("backdrop: clone failed for '{}'. Piece skipped.", def.mesh);
                 continue;
             }
             auto& piece = g_active.emplace_back();
@@ -507,7 +774,7 @@ namespace MTB::Backdrop {
                 radius = clone->worldBound.radius;
             }
             if (radius < 1.0f) {
-                spdlog::warn("backdrop: '{}' has no usable bound - assuming radius 512.",
+                spdlog::warn("backdrop: '{}' has no usable bound, assuming radius 512.",
                              piece.def.mesh);
                 radius = 512.0f;
             }
@@ -519,8 +786,11 @@ namespace MTB::Backdrop {
             if (piece.def.tint) {
                 CollectTints(piece);
             }
+            if (!piece.def.image.empty()) {
+                ApplyImage(piece);
+            }
             if (!clone->AsFadeNode()) {
-                spdlog::debug("backdrop: '{}' root is not a fade node - the piece "
+                spdlog::debug("backdrop: '{}' root is not a fade node. The piece "
                               "pops in (its tint still ramps).", piece.def.name);
             }
             ++up;
@@ -529,7 +799,7 @@ namespace MTB::Backdrop {
             // authored around its origin - the datum for dialing offsets
             // from evidence.
             const auto centerOff = clone->worldBound.center - clone->world.translate;
-            spdlog::info("backdrop: '{}' up - mesh '{}' (demand {:.1f} ms), unit r={:.0f}, "
+            spdlog::info("backdrop: '{}' up: mesh '{}' (demand {:.1f} ms), unit r={:.0f}, "
                          "scale {:.3f}, world ({:.0f},{:.0f},{:.0f}), bound r={:.0f} "
                          "center off ({:.0f},{:.0f},{:.0f}), {} tintable geom(s).",
                          piece.def.name, piece.def.mesh, QpcMs(t0.QuadPart, t1.QuadPart),
@@ -569,8 +839,8 @@ namespace MTB::Backdrop {
                         return RE::BSVisit::BSVisitControl::kContinue;
                     });
                 if (geoms == 0) {
-                    spdlog::warn("backdrop diag: '{}' has ZERO BSGeometry after load "
-                                 "- the legacy NiTriShape did NOT convert; the piece "
+                    spdlog::warn("backdrop diag: '{}' has ZERO BSGeometry after load. "
+                                 "The legacy NiTriShape did NOT convert; the piece "
                                  "cannot render.", piece.def.name);
                 }
             }
@@ -586,11 +856,15 @@ namespace MTB::Backdrop {
             // arm blooms them in from 0; a mid-menu rebuild lands at 1.
             const float t = Transition::Value();
             const float brightness = cfg.backdropBrightness * t;
+            g_shaderValueLines = 0;  // a fresh arm gets a fresh budget
             for (auto& piece : g_active) {
                 PushPieceFade(piece, t);
-                PushTint(piece, look, brightness);
+                const RE::NiColor pushed = PushTint(piece, look, brightness);
+                PushImageBrightness(piece, cfg.backdropImageBrightness * t);
+                LogShaderValues(piece, pushed, true, brightness,
+                                cfg.backdropImageBrightness * t, t);
             }
-            spdlog::info("backdrop: background '{}' + stage '{}' up - {} piece(s) (mode {}).",
+            spdlog::info("backdrop: background '{}' + stage '{}' up: {} piece(s) (mode {}).",
                          g_appliedBackground, cfg.declutterMode == 3 ? g_appliedStage.c_str()
                                                                      : "(none)",
                          up, g_appliedMode);
@@ -685,7 +959,7 @@ namespace MTB::Backdrop {
             }
             g_occluder.unitRadius = radius > 1.0f ? radius : 512.0f;
             parent->AttachChild(clone, true);
-            spdlog::debug("occluder: (re)built cold - warms for the next open.");
+            spdlog::debug("occluder: (re)built cold, warms for the next open.");
         }
         // Reposition to the player, then un-cull. FitTransform + Update makes the
         // transform current the SAME frame; SetAppCulled(false) is consulted live
@@ -739,7 +1013,7 @@ namespace MTB::Backdrop {
                 modeChanged || g_appliedStage != cfg.backdropStage ||
                 g_appliedBackground != cfg.backdropBackground;
             if (setChanged) {
-                spdlog::info("backdrop: set switched mid-menu - rebuilding "
+                spdlog::info("backdrop: set switched mid-menu, rebuilding "
                              "(bg '{}', stage '{}', mode {}).",
                              cfg.backdropBackground, cfg.backdropStage, cfg.declutterMode);
                 Remove();
@@ -750,6 +1024,40 @@ namespace MTB::Backdrop {
         auto* player = RE::PlayerCharacter::GetSingleton();
         auto* playerRoot = player ? player->Get3D(false) : nullptr;
         auto* parent = playerRoot ? playerRoot->parent : nullptr;
+
+        // ⚠⚠ A 3D REBUILD MOVES THE SCENE PARENT OUT FROM UNDER THE PIECES, AND
+        // THAT WAS A SILENT SKIP. The refit below already compares
+        // `node->parent == parent` and simply does nothing when it does not
+        // match, so a backdrop left hanging under the old parent went on being
+        // tinted and faded from here while it was no longer anywhere near the
+        // character. Nothing said so, in any log, ever.
+        //
+        // OccluderShow asks this same question two hundred lines up and treats
+        // the answer as a repair. The pieces had the read and not the repair.
+        //
+        // Field 2026-08-27: "menu studio bug still happens ... usually when I
+        // change from male to female or vice versa from importing looks
+        // presets", which is exactly when Get3D(false) is replaced.
+        //
+        // ⚠ THE REBUILD IS THE PATH A PRESET SWITCH ALREADY TAKES, not a new
+        // one: Remove then Apply, the same pair `setChanged` uses above.
+        if (parent) {
+            std::size_t orphaned = 0;
+            for (const auto& piece : g_active) {
+                if (piece.node && piece.node->parent != parent) {
+                    ++orphaned;
+                }
+            }
+            if (orphaned != 0) {
+                spdlog::info("backdrop: {} of {} piece(s) hang under a scene parent that is no "
+                             "longer the player's, which is what a 3D rebuild leaves behind, so "
+                             "the set goes up again.",
+                             orphaned, g_active.size());
+                Remove();
+                Apply();
+                return;
+            }
+        }
 
         const auto look = cfg.CurrentLook();
         const float t = Transition::Value();
@@ -763,8 +1071,11 @@ namespace MTB::Backdrop {
             // camera costs nothing. Non-background pieces get 0 (unchanged).
             const float wantYaw = BackgroundYawDeg(cfg, piece);
             const bool yawChanged = std::abs(wantYaw - piece.def.yawDeg) > 0.05f;
+            const bool settleRefit =
+                MTB::BackdropAnchorPolicy::ShouldRefitAfterArm(
+                    piece.def.isDome, g_settleRefitTicksRemaining);
             if (piece.def.dialable && parent && node->parent == parent &&
-                (refit || yawChanged)) {
+                (refit || yawChanged || settleRefit)) {
                 // Sliders edit the Settings fields - refresh our copy. The
                 // shell (exactTint) tracks the dome at 1.08x; the dome and
                 // floor take their own radius.
@@ -787,9 +1098,36 @@ namespace MTB::Backdrop {
                 node->SetAppCulled(false);
             }
             PushPieceFade(piece, t);
+            RE::NiColor pushed{};
             if (piece.def.tint) {
-                PushTint(piece, look, cfg.backdropBrightness * t);
+                pushed = PushTint(piece, look, cfg.backdropBrightness * t);
             }
+            PushImageBrightness(piece, cfg.backdropImageBrightness * t);
+            LogShaderValues(piece, pushed, piece.def.tint, cfg.backdropBrightness * t,
+                            cfg.backdropImageBrightness * t, t);
+        }
+        if (!g_settleLoggedThisArm && player) {
+            if (auto* camera = RE::PlayerCamera::GetSingleton()) {
+                if (auto* root = camera->cameraRoot.get()) {
+                    const auto playerPos = player->GetPosition();
+                    const auto rootPos = playerRoot ? playerRoot->world.translate : playerPos;
+                    const auto delta = root->world.translate - playerPos;
+                    spdlog::info(
+                        "backdrop: spherical pieces settled around player ref "
+                        "({:.0f},{:.0f},{:.0f}); 3D root ({:.0f},{:.0f},{:.0f}), "
+                        "camera ({:.0f},{:.0f},{:.0f}), camera-player distance {:.0f}.",
+                        playerPos.x, playerPos.y, playerPos.z,
+                        rootPos.x, rootPos.y, rootPos.z,
+                        root->world.translate.x, root->world.translate.y,
+                        root->world.translate.z,
+                        std::sqrt(delta.x * delta.x + delta.y * delta.y +
+                                  delta.z * delta.z));
+                    g_settleLoggedThisArm = true;
+                }
+            }
+        }
+        if (g_settleRefitTicksRemaining > 0) {
+            --g_settleRefitTicksRemaining;
         }
     }
 
@@ -805,20 +1143,26 @@ namespace MTB::Backdrop {
         const float t = Transition::Value();
         for (auto& piece : g_active) {
             PushPieceFade(piece, t);
+            RE::NiColor pushed{};
             if (piece.def.tint) {
-                PushTint(piece, look, cfg.backdropBrightness * t);
+                pushed = PushTint(piece, look, cfg.backdropBrightness * t);
             }
+            PushImageBrightness(piece, cfg.backdropImageBrightness * t);
+            LogShaderValues(piece, pushed, piece.def.tint, cfg.backdropBrightness * t,
+                            cfg.backdropImageBrightness * t, t);
         }
     }
 
     void Remove() {
         g_attemptedThisArm = false;
+        g_settleRefitTicksRemaining = 0;
         if (!g_up) {
             return;
         }
         int down = 0;
         for (auto& piece : g_active) {
             RestoreTints(piece);
+            RestoreImage(piece);
             if (piece.node) {
                 if (auto* parent = piece.node->parent) {
                     parent->DetachChild2(piece.node.get());

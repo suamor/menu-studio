@@ -25,4 +25,11 @@ namespace MTB::VersionCheck {
     // which callers must treat as "do not install this hook".
     std::ptrdiff_t DispatchCallOffset();
     std::ptrdiff_t SmootherCallOffset();
+    std::ptrdiff_t CollisionTestCallOffset();
+    // The two devirtualized TESCamera::Update calls (AE; 0 on SE, where every
+    // caller goes through the vtable and the write_vfunc covers it alone).
+    std::ptrdiff_t CameraPlayerCallOffset();
+    std::ptrdiff_t CameraMasterCallOffset();
+    // The input pump's dispatch call (the FLICK-shared site; both builds).
+    std::ptrdiff_t InputPumpCallOffset();
 }

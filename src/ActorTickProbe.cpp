@@ -59,15 +59,15 @@ namespace MTB::ActorTickProbe {
         // The interpretation is spelled out in the log line itself. A bare
         // number invites the next reader to guess which way round it means,
         // and this project has lost rounds to exactly that.
-        spdlog::info("actor tick probe: menu DISARMED at count {} - Actor::Update ran {} "
+        spdlog::info("actor tick probe: menu DISARMED at count {}. Actor::Update ran {} "
                      "time(s) while the menu was open. {}",
                      now, delta,
                      delta == 0
                          ? "ZERO: the actor does not update while paused, so anything the "
                            "engine defers to it (a queued equip, the weapon replace) cannot "
-                           "run either - consistent with r22/r23."
+                           "run either, consistent with r22/r23."
                          : "NON-ZERO: the actor DOES update while paused, so a queue that "
-                           "drains from it is NOT the explanation - hypothesis refuted.");
+                           "drains from it is NOT the explanation. Hypothesis refuted.");
     }
 
     void Install() {
@@ -83,7 +83,7 @@ namespace MTB::ActorTickProbe {
         PlayerUpdateHook::func = playerVtbl.write_vfunc(0x0AD, PlayerUpdateHook::thunk);
         g_installed            = true;
         spdlog::info("actor tick probe: hooked PlayerCharacter::Update (vfunc 0x0AD). "
-                     "Counts whether the ACTOR updates while a menu holds the pause - "
+                     "Counts whether the ACTOR updates while a menu holds the pause. "
                      "Bubble ticks the animation graph by hand but never this.");
     }
 

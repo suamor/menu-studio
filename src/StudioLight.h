@@ -19,5 +19,23 @@ namespace MTB {
         // a switch re-open parks it again.
         void RestoreSkyModeEarly();  // bubble-menu close edge
         void ReparkSkyMode();        // bubble-menu open while armed (switch)
+
+        // r46 (user, field: the sun outside still lights the character).
+        // OUTDOORS NOTHING ABOVE HAS EVER REACHED THE LIGHTING. Apply's cell
+        // override needs INTERIOR_DATA an exterior does not have, and
+        // Declutter's r33 light cut walks the CELL's scene graph, which the sun
+        // does not live in - F-18 shipped saying so, "exteriors, sun untouched".
+        // This parks the sun, the cloud light beside it and the sky's
+        // directional ambient for the duration of a void, and releases them
+        // again everywhere else.
+        //
+        // ⚠ STATE-BASED AND IDEMPOTENT, not an edge. It decides park-or-release
+        // from the settings and the cell every time it is called, which is what
+        // lets the armed tick call it as a re-assert: Sky::Update runs in the
+        // unpaused switch and exit windows and repaints both of these from the
+        // weather, and a park that only fired on the arm edge would lose them
+        // there. Cheap enough for that - a few pointer reads and compares when
+        // the answer has not changed.
+        void SyncExteriorSun();
     }
 }

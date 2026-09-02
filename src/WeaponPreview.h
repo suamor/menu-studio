@@ -87,4 +87,20 @@ namespace MTB::WeaponPreview {
     // BEFORE the first Update() of the session.
     void ArmEdgeReset();
 
+    // ⚠ OS-108, PLAYER HALF. TRUE when the bubble armed on a player the live
+    // world was already moving.
+    //
+    // A moving arm keeps its live movement state, which is
+    // MovementArmPolicy::Plan::freezeCaughtPose and the reason the exit is
+    // seamless. The pumps have to honour that contract too, and they cannot
+    // work it out for themselves: one runs from an OnItemEquipped vfunc hook
+    // and one from the per-tick swap path, so neither can see the arm edge.
+    //
+    // Bubble sets this at the arm edge BEFORE the first Update() of the
+    // session, because that Update can itself reach a pump, and clears it at
+    // disarm. Gate it on the POLICY's freezeCaughtPose, never on the
+    // bMovingArmStandsAside latch, which is off by default and would leave this
+    // dead for every user.
+    void SetMovingArm(bool a_moving);
+
 }  // namespace MTB::WeaponPreview

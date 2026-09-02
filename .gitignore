@@ -14,3 +14,7 @@ docs/
 
 # session worktrees (match Fitting Room; keeps worktree contents out of git status)
 .claude/
+
+# MSVC object files from hand-compiling a single test
+*.obj
+tools/build_diag.log

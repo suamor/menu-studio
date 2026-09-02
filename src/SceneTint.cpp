@@ -57,7 +57,7 @@ namespace MTB::SceneTint {
     void Apply(const Settings::TintValues& a_tint) {
         auto* mgr = ImageSpaceMgr();
         if (!mgr) {
-            spdlog::warn("scenetint: ImageSpaceManager singleton null - cannot filter.");
+            spdlog::warn("scenetint: ImageSpaceManager singleton null, cannot filter.");
             return;
         }
         auto** slot = CurrentSlot(mgr);

@@ -60,9 +60,8 @@ namespace MTB::Offsets {
 
     // Third-person camera position builder (SE RVA 0x850260) - hosts the
     // collision-smoother call CameraGate gates. AE 50911 (FUN_1408e8640):
-    // decompile-matched via its caller (49960->50896). NOTE: AE INLINED the
-    // collision smoother (SE 49980) into this builder - there is no standalone
-    // call, so SmootherCallOffset has no AE E8 site (see below).
+    // decompile-matched via its caller (49960->50896). AE inlined the smoother,
+    // but its obstruction query remains one ordinary call (below).
     inline constexpr REL::RelocationID CameraPositionBuilder{ 49975, 50911 };
 
     // The collision smoother the builder above calls on SE - the TARGET of
@@ -71,6 +70,86 @@ namespace MTB::Offsets {
     // RelocationID::address() returns 0 for a zero id, which VersionCheck
     // reports as "n/a on this runtime" rather than as a failure.
     inline constexpr REL::RelocationID CameraCollisionSmoother{ 49980, 0 };
+
+    // AE's obstruction query inside the inlined smoother. 1.6.1170 builder
+    // 50911 calls ID 50832 exactly once at +0x1CE. The query mutates the
+    // proposed ThirdPersonState::translation when it hits geometry; gating
+    // this call plus settling collisionPos reproduces the SE bypass without
+    // replacing the whole position builder. SE keeps using the smoother hook.
+    inline constexpr REL::RelocationID CameraCollisionTest{ 0, 50832 };
+
+    // TESCamera::Update - the base body that actually copies the camera state
+    // into cameraRoot. It is PlayerCamera vtable slot 2 on BOTH builds
+    // (RTTI-verified: SE vtable 0x16A9EE0 -> 0x4F5B60, AE vtable 0x18EF278 ->
+    // 0x5510A0), which is what the studio camera's write_vfunc re-assert
+    // covers. The pair matches CommonLib's published TESCamera::Update ids -
+    // the independent cross-check that the RTTI walk found the right body.
+    inline constexpr REL::RelocationID TESCameraUpdateBase{ 32289, 33025 };
+
+    // ⚠ AE DEVIRTUALIZED THE ENGINE'S OWN CALLS TO THAT BODY, WHICH IS WHY A
+    // VTABLE HOOK ALONE WAS A DECOY THERE. Exhaustive E8 scan over .text:
+    // SE 1.5.97 has ZERO direct callers (every SE path dispatches through the
+    // vtable), AE 1.6.1170 has exactly two, and they are the per-frame ones -
+    // the player-update chunk (40450, calls at +0x69) and PlayerCamera's
+    // master per-frame update (50784, the id camera mods detour, calls at
+    // +0x1A6). A mod driving the camera during a menu reaches the root write
+    // through one of these whether it calls camera->Update() virtually or the
+    // master update by id. Both containers are 0 on SE on purpose, same
+    // convention as CameraCollisionSmoother: no site, hook simply absent.
+    inline constexpr REL::RelocationID PlayerUpdateCameraCaller{ 0, 40450 };
+    inline constexpr REL::RelocationID PlayerCameraMasterUpdate{ 0, 50784 };
+
+    // The input pump's dispatch call, the site every ImGui-overlay mod hooks
+    // (FLICK's PDB names its thunk on it Hooks::ProcessInputQueue). FLICK
+    // swallows the whole queue while one of its windows holds the mouse, which
+    // is upstream of every BSTEventSource sink - so a camera gesture that
+    // starts before its passthrough opens simply never existed as far as a
+    // sink can tell. Menu Studio chains at the same site and, loading after
+    // FUCK.dll, wraps it: the tap reads the REAL queue before the swallow.
+    // Verified on both clean binaries: the E8 sits at +0x7B in the container
+    // and its target is the dispatch below (cross-check: the AE container is
+    // the call at Main::Update+0x567).
+    inline constexpr REL::RelocationID InputPumpCaller{ 67315, 68617 };
+    inline constexpr REL::RelocationID InputPumpDispatch{ 67355, 68655 };
+
+    // Inventory3DManager's item-stage visibility paths. UpdateMagic3D clears
+    // kHidden on a cached selection; the appender attaches both synchronous
+    // and late async models visible. ItemPreviewBroker post-hides each write.
+    inline constexpr REL::RelocationID Inventory3DUpdateMagic{ 50885, 51758 };
+    inline constexpr REL::RelocationID Inventory3DAppendModel{ 50896, 51772 };
+
+    // UIMessageQueue::AddMessage - how a menu is asked to open or close. The
+    // ids are CommonLib's own (Offsets.h, RELOCATION_ID(13530, 13631)); they
+    // are repeated here so the self-check can PROVE the id is in the running
+    // database before anything calls it.
+    //
+    // ⚠ THAT PROOF IS NOT CEREMONY, IT IS A CRASH THIS MOD ALREADY SHIPPED.
+    // CommonLib's AE id for Script::CompileAndRun is 21890 and 21890 is ABSENT
+    // from the 1.6.1170 database. id2offset's lower_bound only fails past the
+    // END of the table, so an absent id resolves to its NEIGHBOUR silently:
+    // the call went to 21891 and took the game down (field log 2026-08-04,
+    // SkyrimSE.exe+0x33D8D9 = 21891+0x59, called from MenuStudio.dll). An id
+    // being in CommonLib is not evidence that it is in the player's database.
+    inline constexpr REL::RelocationID UIMessageQueueAddMessage{ 13530, 13631 };
+
+    // The engine's limited-racemenu switch: a static bool the RaceSexMenu
+    // reads at open to hide race and sex - the mode Galathil the face
+    // sculptor uses, and the whole body of Game.ShowLimitedRaceMenu() is
+    // "set this to 1, post the same kShow message we already post"
+    // (AE 1.6.1170 native worker 0x140953450, decompiled 2026-08-05:
+    // DAT_1431af130 = 1; AddMessage(queue, InterfaceStrings+0x160, kShow, 0)).
+    // The menu's own code carries the writes back to 0, so setting it is the
+    // entire contract. AE id 406380 = RVA 0x31af130, round-tripped through
+    // the 1.6.1170 Address Library.
+    //
+    // ⚠ THE SE ID IS PATTERN-MATCHED, NOT PROVEN. 519785 is the byte a
+    // worker in the SE racemenu region sets to 1 beside the same AddMessage
+    // call, but which NATIVE owns that worker was never pinned down by
+    // decompile, and a static WRITE through a wrong id corrupts a stranger's
+    // global with no crash to notice it by. So the action bar only writes
+    // this on AE and says so on SE - prove the SE side before widening,
+    // exactly per the CompileAndRun note above.
+    inline constexpr REL::RelocationID RaceMenuLimitedFlag{ 519785, 406380 };
 
     // Studio rig lights - engine factories for formless render-side lights
     // (no LIGH forms, no placed refs, zero save surface; the approach
@@ -87,6 +166,24 @@ namespace MTB::Offsets {
     inline constexpr REL::RelocationID NiPointLightCreate{ 69582, 70966 };     // () -> NiPointLight*
     inline constexpr REL::RelocationID ShadowSceneAddLight{ 99692, 106326 };   // (SSN*, NiLight*, params*) -> BSLight*
     inline constexpr REL::RelocationID ShadowSceneRemoveLight{ 99698, 106332 };// (SSN*, NiPointer<BSLight>&)
+
+    // r46 exterior sun park: BSShaderManager::State, the renderer's own
+    // global. Two things are read out of it, both at fixed offsets that are
+    // the SAME on SE and AE (CommonLib declares the struct with plain member
+    // offsets and only relocates the singleton itself, which is what makes
+    // that claim checkable rather than assumed):
+    //   +0x00  ShadowSceneNode* shadowSceneNode[4] - slot 0 is the world's,
+    //          and its sunLight/cloudLight are the BSLights the gather
+    //          actually reads. Taken from here rather than from Sky::sun so
+    //          the light we write is the one the renderer uses.
+    //   +0xC8  NiTransform directionalAmbientTransform - the sky's ambient
+    //          fill on every surface in frame.
+    // ⚠ THE IDS ARE COMMONLIB'S OWN (RELOCATION_ID(513211, 390951)), not a
+    // reading of ours - the version of CommonLib this project builds against
+    // predates the header that declares them. VersionCheck carries it as
+    // kData for exactly that reason: if the id is wrong on a build, the
+    // plugin declines to load rather than writing over a stranger.
+    inline constexpr REL::RelocationID ShaderManagerState{ 513211, 390951 };
 
     // Sky's forced interior-lighting refresh (SE RVA 0x3B4030): when an
     // interior cell is current it re-pulls ambient/directional/fog/DALC
@@ -173,5 +270,24 @@ namespace MTB::Offsets {
     // AE - a documented limitation, not an error.
     inline std::ptrdiff_t SmootherCallOffsetHint() {
         return REL::Relocate(std::ptrdiff_t{ 0x1C5 }, std::ptrdiff_t{ 0 });
+    }
+
+    // AE position builder -> inlined smoother's obstruction query.
+    inline std::ptrdiff_t CollisionTestCallOffsetHint() {
+        return REL::Relocate(std::ptrdiff_t{ 0 }, std::ptrdiff_t{ 0x1CE });
+    }
+
+    // The two devirtualized TESCamera::Update calls (AE only; SE has none).
+    // Measured on the 1.6.1170 binary by target-verified E8 scan.
+    inline std::ptrdiff_t CameraPlayerCallOffsetHint() {
+        return REL::Relocate(std::ptrdiff_t{ 0 }, std::ptrdiff_t{ 0x69 });
+    }
+    inline std::ptrdiff_t CameraMasterCallOffsetHint() {
+        return REL::Relocate(std::ptrdiff_t{ 0 }, std::ptrdiff_t{ 0x1A6 });
+    }
+
+    // Input pump -> dispatch (InputPumpDispatch). Same +0x7B on both builds.
+    inline std::ptrdiff_t InputPumpCallOffsetHint() {
+        return REL::Relocate(std::ptrdiff_t{ 0x7B }, std::ptrdiff_t{ 0x7B });
     }
 }

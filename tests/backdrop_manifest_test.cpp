@@ -28,9 +28,19 @@ int main() {
         CHECK(p.bgImage == "textures\\mtb\\backdrops\\a.dds");
         CHECK(p.bgDome.empty());
         CHECK(p.bgFaceCamera == true);  // image default is true
-        CHECK(p.bgRadius == 2000.0f);
+        CHECK(p.bgRadius == 1200.0f);  // explicit values clamp to the supported maximum
         CHECK(p.hasStage);
         CHECK(p.floorMesh == "meshes\\m\\f.nif");
+    }
+
+    // Backgrounds without an authored radius use Menu Studio's shipped size.
+    {
+        auto p = ParseBackdropManifest(
+            "[Pack]\nname=Default size\n[Background]\ndome=meshes\\m\\dome.nif\n",
+            "default-size");
+        CHECK(p.valid);
+        CHECK(p.hasBackground);
+        CHECK(p.bgRadius == 800.0f);
     }
 
     // 2. Missing [Pack] name => invalid.
@@ -47,6 +57,52 @@ int main() {
         CHECK(p.bgImage == "a.dds");
         CHECK(p.bgDome.empty());
         CHECK(!p.warnings.empty());
+    }
+
+    // 3b. Non-.dds image parses but warns - the engine would substitute a
+    // placeholder at load with no error, so the parse is the tripwire.
+    {
+        auto p = ParseBackdropManifest(
+            "[Pack]\nname=P\n[Background]\nimage=mtb\\sky.png\n", "p");
+        CHECK(p.valid);
+        CHECK(p.bgImage == "mtb\\sky.png");
+        CHECK(!p.warnings.empty());
+    }
+    {
+        auto p = ParseBackdropManifest(
+            "[Pack]\nname=P2\n[Background]\nimage=mtb\\sky.DDS\n", "p2");
+        CHECK(p.valid);
+        CHECK(p.warnings.empty());  // case-blind: .DDS is fine
+    }
+
+    // 3c. Numbered backgrounds: [Background] + [Background1..N], own names,
+    // stop at the first absent section, pack group carried through.
+    {
+        auto p = ParseBackdropManifest(
+            "[Pack]\nname=Skies\ngroup=Load order skies\n"
+            "[Background]\nname=Sovngarde\ndome=sky\\sovngarde.nif\n"
+            "[Background1]\ndome=sky\\dome2.nif\n"
+            "[Background2]\nname=Third\nimage=mtb\\third.dds\n"
+            "[Background4]\ndome=sky\\never.nif\n",  // gap: 3 absent, 4 unread
+            "skies");
+        CHECK(p.valid);
+        CHECK(p.group == "Load order skies");
+        CHECK(p.backgrounds.size() == 3);
+        CHECK(p.backgrounds[0].name == "Sovngarde");
+        CHECK(p.backgrounds[1].name == "Skies 1");   // default numbered name
+        CHECK(p.backgrounds[1].dome == "sky\\dome2.nif");
+        CHECK(p.backgrounds[2].name == "Third");
+        CHECK(p.backgrounds[2].image == "mtb\\third.dds");
+        CHECK(p.backgrounds[2].faceCamera == true);  // image default
+        CHECK(p.bgDome == "sky\\sovngarde.nif");     // first-background mirror
+    }
+
+    // 3d. thumb= rides a background section through to the parse.
+    {
+        auto p = ParseBackdropManifest(
+            "[Pack]\nname=T\n[Background]\ndome=d.nif\nthumb=mtb\\skies\\t.png\n", "t");
+        CHECK(p.valid);
+        CHECK(p.backgrounds[0].thumb == "mtb\\skies\\t.png");
     }
 
     // 4. Dome background: faceCamera defaults false.

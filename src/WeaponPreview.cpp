@@ -5,6 +5,7 @@
 #include "ClipProbe.h"  // the equip pump budgets from the clip's real length
 #include "EquipSoundMute.h"
 #include "Settings.h"
+#include "WeaponPumpPolicy.h"
 #include "WeaponPreviewGate.h"
 
 #include <cmath>
@@ -174,9 +175,10 @@ namespace MTB::WeaponPreview {
         // The step budget stays a HARD ceiling - this only ever stops EARLIER,
         // never later, so a pump can still not run away.
         //
-        // ⚠ Behind bPumpStopsAtIdle, DEFAULT OFF. The measurement that selects
-        // this has not been taken on the actual repro yet. Run the repro with
-        // it off, read the "idle session:" line, turn it on, run it again.
+        // bPumpStopsAtIdle is now DEFAULT ON. The field comparison selected it:
+        // the off run put 28/30 idle picks inside pumps and advanced 26.87s of
+        // graph time; the first bounded run reduced time but exposed the final
+        // off-by-one, so pumps now hold one graph step before idle selection.
         // ⚠ r2 (field 2026-07-21 14:58). The first version of this guarded only
         // on "is the draw I am driving still finishing?", and the field showed
         // that predicate is blind to the pumps that actually cause the loop:
@@ -200,14 +202,15 @@ namespace MTB::WeaponPreview {
         //
         //   DRIVING  - a draw/sheathe is in flight. Run until it reaches its
         //              idle, then stop. (This half was right and is unchanged.)
-        //   BLIND    - nothing in flight. Do not fast-forward a settled graph.
-        //              Stop the instant a step re-picks the idle, and cap the
-        //              whole thing at a couple of frames regardless.
+        //   BLIND    - nothing in flight. Do not touch a settled graph. The
+        //              field trace proved the equip clip arrives on a later
+        //              engine frame regardless, so even one step buys nothing
+        //              and can re-pick the lunge idle.
         //
         // Idles are kModeSinglePlay (mode=0, measured), so stepping a settled
         // one far enough ENDS it and hands the state machine a re-pick. That is
         // the loop, and in the blind regime it is entirely self-inflicted.
-        constexpr int kPumpBlindSteps = 2;  // 0.07s - lets a change land, ends nothing
+        constexpr int kPumpBlindSteps = 0;
 
         // Why the last pump stopped early, or null if it ran its whole budget.
         // Named rather than a bare "STOPPED AT IDLE": r1 stopped for exactly
@@ -231,24 +234,38 @@ namespace MTB::WeaponPreview {
             int              taken         = 0;
             const char*      why           = nullptr;
             for (; taken < a_steps; ++taken) {
-                if (bound) {
-                    if (sawTransition) {
-                        if (!ClipProbe::EquipTransitionUnfinished()) {
-                            why = "DRAW SETTLED";
-                            break;
-                        }
-                    } else {
-                        if (ClipProbe::IdlePickCount() != picksAtEntry) {
-                            why = "RE-PICKED THE IDLE";
-                            break;
-                        }
-                        if (taken >= kPumpBlindSteps) {
+                const auto action = WeaponPumpPolicy::Decide({
+                    .bounded = bound,
+                    .sawTransition = sawTransition,
+                    .transitionUnfinished = ClipProbe::EquipTransitionUnfinished(),
+                    .idlePickChanged = ClipProbe::IdlePickCount() != picksAtEntry,
+                    .stepsTaken = taken,
+                    .blindStepLimit = kPumpBlindSteps,
+                    .transitionRemainingSeconds =
+                        ClipProbe::EquipTransitionRemainingGraphSeconds(),
+                    .stepSeconds = kPumpStep,
+                });
+                if (action != WeaponPumpPolicy::Action::kContinue) {
+                    switch (action) {
+                        case WeaponPumpPolicy::Action::kStopNothingToDrive:
                             why = "NOTHING TO DRIVE";
                             break;
-                        }
+                        case WeaponPumpPolicy::Action::kStopTransitionSettled:
+                            why = "DRAW SETTLED";
+                            break;
+                        case WeaponPumpPolicy::Action::kHoldBeforeIdle:
+                            why = "HELD BEFORE IDLE";
+                            break;
+                        case WeaponPumpPolicy::Action::kStopIdleRepicked:
+                            why = "RE-PICKED THE IDLE";
+                            break;
+                        case WeaponPumpPolicy::Action::kContinue:
+                            break;
                     }
+                    break;
                 }
                 a_player->UpdateAnimation(kPumpStep);
+                ClipProbe::AdvanceEquipTransitionGraphSeconds(kPumpStep);
                 // Re-assert AFTER the step, because the step is what undoes it.
                 HoldLocomotionZero(a_player);
                 if (!sawTransition) {
@@ -260,7 +277,7 @@ namespace MTB::WeaponPreview {
             float speedNow = -1.0f;
             a_player->GetGraphVariableFloat("Speed", speedNow);
             if (speedNow > 1.0f) {
-                spdlog::warn("weapon preview: pump ({}) - Speed is STILL {:.2f} after the "
+                spdlog::warn("weapon preview: pump ({}): Speed is STILL {:.2f} after the "
                              "settle re-assert; something outside UpdateAnimation is driving "
                              "locomotion and the character will walk in the menu.",
                              a_why, speedNow);
@@ -372,7 +389,7 @@ namespace MTB::WeaponPreview {
                     // holds this same base form. Logged because it is the
                     // precondition of the bug this ledger fixes, so a field log
                     // says outright whether the reporter's loadout can reach it.
-                    spdlog::debug("weapon preview: both hands hold '{}' - muted once, not twice "
+                    spdlog::debug("weapon preview: both hands hold '{}', muted once, not twice "
                                   "(the double-null that silenced it permanently).",
                                   weap->GetName());
                 }
@@ -412,8 +429,52 @@ namespace MTB::WeaponPreview {
             a_player->SetGraphVariableFloat("Direction", 0.0f);
         }
 
-        void SettleLocomotion(RE::PlayerCharacter* a_player) {
+        // ⚠ TRUE WHEN THE BUBBLE ARMED ON A PLAYER THE LIVE WORLD WAS ALREADY
+        // MOVING. Set by Bubble at the arm edge, before the first Update() of
+        // the session; cleared at disarm and by Reset(). The pumps cannot work
+        // this out for themselves: two of the three run from a vfunc hook and
+        // from the per-tick swap path, neither of which can see the arm edge.
+        bool movingArm = false;
+
+        // ⚠ THE moveStop EVENT IS WITHHELD ON A MOVING ARM. OS-108, PLAYER HALF.
+        //
+        // Field 2026-08-09, reproduced in a four-mod load order: sprint, open
+        // the inventory, equip or unequip a sword, close with the key still
+        // held, and the character slides forward under a standing idle until
+        // they stop and move again.
+        //
+        // That is the companion's bug with the actor swapped, and her fix is
+        // twenty lines of comment in Bubble.cpp saying so: "a follower caught
+        // mid-stride had moveStop fired ... on exit her package moves her again
+        // while the graph is still pinned, and she slides with no locomotion
+        // under her". Her path got the exemption. The player got it at his ARM
+        // EDGE, through MovementArmPolicy, and on the companion path. This file
+        // never got it, and this file owns the only other moveStop in the
+        // plugin.
+        //
+        // Why the event and not the variables. Skyrim leaves the standing
+        // branch on a moveStart EDGE, and a key held across the pause never
+        // produces one. The mod does not send one either: there is no moveStart
+        // anywhere in this codebase, because the mirror that used to send one
+        // was deleted for visibly sliding on exit. So a moveStop delivered here
+        // is a debt nothing can ever pay, and the graph stays standing while the
+        // character controller keeps translating the actor.
+        //
+        // The VARIABLES stay, on both kinds of arm. They are idempotent, the
+        // engine rewrites Speed from inside its own movement-to-graph sync, and
+        // without them the pump replays a walk inside the menu, which is the r12
+        // report. Only the event is unpayable.
+        void SettleLocomotion(RE::PlayerCharacter* a_player, const char* a_why) {
             SettleLocomotionVars(a_player);
+            if (movingArm) {
+                spdlog::info("weapon preview: settle ({}): moveStop WITHHELD, the menu "
+                             "armed on a MOVING player; the movement graph keeps its "
+                             "locomotion state so the exit is seamless (OS-108).",
+                             a_why);
+                return;
+            }
+            spdlog::debug("weapon preview: settle ({}): moveStop sent (standing arm).",
+                          a_why);
             a_player->NotifyAnimationGraph("moveStop");
         }
 
@@ -433,7 +494,7 @@ namespace MTB::WeaponPreview {
             a_player->GetGraphVariableBool("bAnimationDriven", animDriven);
             auto* const form = RightHandWeapon(a_player);
             auto* const weap = form ? form->As<RE::TESObjectWEAP>() : nullptr;
-            spdlog::debug("weapon preview: pose ({}) - Speed={:.2f} Direction={:.2f} "
+            spdlog::debug("weapon preview: pose ({}): Speed={:.2f} Direction={:.2f} "
                           "iRightHandEquipped={} weaponType={} animDriven={}",
                           a_why, speed, dir, iRight,
                           weap ? static_cast<int>(weap->GetWeaponType()) : -1, animDriven);
@@ -490,7 +551,7 @@ namespace MTB::WeaponPreview {
         void LogWeaponNodes(RE::PlayerCharacter* a_player, const char* a_why) {
             const auto& biped = a_player->GetBiped();
             if (!biped) {
-                spdlog::debug("weapon diag: nodes ({}) - NO BIPED", a_why);
+                spdlog::debug("weapon diag: nodes ({}): NO BIPED", a_why);
                 return;
             }
             std::string out;
@@ -550,14 +611,14 @@ namespace MTB::WeaponPreview {
             if (!state) {
                 return false;
             }
-            SettleLocomotion(a_player);
+            SettleLocomotion(a_player, a_why);
             const auto before = state->GetWeaponState();
             // OPEN FENCE. The pump's own report prints AFTER it, so without
             // this the anim events it causes can only be attributed to it by
             // ordering. r21's diff is read event by event and the whole answer
             // turns on which pump raised what, so make the attribution exact
             // rather than inferred - two lines beats re-running a field test.
-            spdlog::debug("weapon preview: pump ({}) BEGIN - ws {} want={}", a_why,
+            spdlog::debug("weapon preview: pump ({}) BEGIN: ws {} want={}", a_why,
                           static_cast<int>(before), static_cast<int>(a_target));
             int steps = 0;
             {
@@ -567,6 +628,7 @@ namespace MTB::WeaponPreview {
                 const ClipProbe::PumpWindow window{ "pump:seek" };
                 while (steps < kPumpMaxSteps && state->GetWeaponState() != a_target) {
                     a_player->UpdateAnimation(kPumpStep);
+                    ClipProbe::AdvanceEquipTransitionGraphSeconds(kPumpStep);
                     ++steps;
                 }
                 ClipProbe::NotePumpSeconds(static_cast<float>(steps) * kPumpStep);
@@ -581,7 +643,7 @@ namespace MTB::WeaponPreview {
             // is what put that in doubt (see PumpGraph), so the settle now stops
             // at the idle too when bPumpStopsAtIdle is on.
             const int settle = PumpGraph(a_player, kPumpSettleSteps, "pump:settle");
-            spdlog::debug("weapon preview: pump ({}) - ws {}->{} want={} in {} steps "
+            spdlog::debug("weapon preview: pump ({}): ws {}->{} want={} in {} steps "
                           "+{}/{} settle ({:.2f}s total) {}",
                           a_why, static_cast<int>(before),
                           static_cast<int>(state->GetWeaponState()),
@@ -662,7 +724,7 @@ namespace MTB::WeaponPreview {
             const auto now = a_state->GetWeaponState();
             if (++slowFrames > kSlowMaxFrames) {
                 spdlog::warn("weapon preview: slow swap CAPPED in phase {} after {} frames "
-                             "(ws={}) - finishing with the in-frame pump.",
+                             "(ws={}), finishing with the in-frame pump.",
                              slowPhase, slowFrames, static_cast<int>(now));
                 if (slowPhase == 1) {
                     PumpToState(a_player, RE::WEAPON_STATE::kSheathed, "slow-cap-sheathe");
@@ -675,12 +737,12 @@ namespace MTB::WeaponPreview {
             if (slowPhase == 1 && now == RE::WEAPON_STATE::kSheathed) {
                 Draw(a_player, true);
                 slowPhase = 2;
-                spdlog::debug("weapon preview: slow swap - sheathe finished in {} real frames, "
+                spdlog::debug("weapon preview: slow swap: sheathe finished in {} real frames, "
                               "redraw issued.", slowFrames);
                 slowFrames = 0;  // r20a: PER-PHASE budget - see kSlowMaxFrames
             } else if (slowPhase == 2 && now == RE::WEAPON_STATE::kDrawn) {
                 slowPhase = 0;
-                spdlog::debug("weapon preview: slow swap - redraw finished in {} real frames. "
+                spdlog::debug("weapon preview: slow swap: redraw finished in {} real frames. "
                               "THIS is the pose to judge.", slowFrames);
                 LogGraphPose(a_player, "slow-done");
                 LogDiag(a_player, "slow-done");
@@ -752,11 +814,11 @@ namespace MTB::WeaponPreview {
         // The swap variant. There is no state edge here, so run a fixed budget
         // and let the engine's own replace animation finish inside the frame.
         void PumpSwap(RE::PlayerCharacter* a_player) {
-            SettleLocomotion(a_player);
-            spdlog::debug("weapon preview: pump (swap) BEGIN - {} steps budgeted",
+            SettleLocomotion(a_player, "swap");
+            spdlog::debug("weapon preview: pump (swap) BEGIN: {} steps budgeted",
                           kPumpSwapSteps);
             const int taken = PumpGraph(a_player, kPumpSwapSteps, "pump:swap");
-            spdlog::debug("weapon preview: pump (swap) - {}/{} steps ({:.2f}s) {}", taken,
+            spdlog::debug("weapon preview: pump (swap): {}/{} steps ({:.2f}s) {}", taken,
                           kPumpSwapSteps, static_cast<float>(taken) * kPumpStep,
                           g_lastPumpStopReason ? g_lastPumpStopReason : "ran full budget");
             LogGraphPose(a_player, "swap");
@@ -850,7 +912,7 @@ namespace MTB::WeaponPreview {
                 return;
             }
             part.partClone->SetAppCulled(false);
-            spdlog::debug("weapon preview: shield was culled while drawn - un-culled "
+            spdlog::debug("weapon preview: shield was culled while drawn, un-culled "
                           "(parent='{}').",
                           part.partClone->parent && part.partClone->parent->name.c_str()
                               ? part.partClone->parent->name.c_str()
@@ -883,7 +945,7 @@ namespace MTB::WeaponPreview {
                 return;
             }
             s_last = key;
-            spdlog::debug("weapon preview: shield slot ({}) - left='{}' has3D={} culled={} "
+            spdlog::debug("weapon preview: shield slot ({}): left='{}' has3D={} culled={} "
                           "parent='{}'",
                           a_why, left && left->GetName() ? left->GetName() : "-", has3D, culled,
                           node);
@@ -938,13 +1000,13 @@ namespace MTB::WeaponPreview {
         // ScopedEquipSoundMute. Declared before the pump and restored by its
         // destructor, so no return path can leave a weapon permanently silent.
         const ScopedEquipSoundMute soundMute{ a_player };
-        SettleLocomotion(a_player);
+        SettleLocomotion(a_player, "engine-equip");
         const float remaining = ClipProbe::EquipClipRemainingSeconds();
         const int   budget    = (remaining > 0.0f)
                                     ? static_cast<int>(std::ceil(remaining / kPumpStep))
                                     : kPumpSwapSteps;
         const int   steps     = (std::min)(budget, kPumpMaxSteps);
-        spdlog::debug("weapon preview: pump (engine-equip) BEGIN - ws {}, {} steps ({:.2f}s "
+        spdlog::debug("weapon preview: pump (engine-equip) BEGIN: ws {}, {} steps ({:.2f}s "
                       "of clip left; default budget {}), equip sound {}",
                       static_cast<int>(state->GetWeaponState()), steps, remaining,
                       kPumpSwapSteps,
@@ -955,7 +1017,7 @@ namespace MTB::WeaponPreview {
                       soundMute.MutedAnything() ? "MUTED for this pump"
                                                 : "NOTHING TO MUTE (form carries none)");
         const int taken = PumpGraph(a_player, steps, "pump:engine-equip");
-        spdlog::debug("weapon preview: pump (engine-equip) - {}/{} steps ({:.2f}s), ws now {} {}",
+        spdlog::debug("weapon preview: pump (engine-equip): {}/{} steps ({:.2f}s), ws now {} {}",
                       taken, steps, static_cast<float>(taken) * kPumpStep,
                       static_cast<int>(state->GetWeaponState()),
                       g_lastPumpStopReason ? g_lastPumpStopReason : "ran full budget");
@@ -964,6 +1026,8 @@ namespace MTB::WeaponPreview {
     }
 
     bool HasDebt() { return weDrew; }
+
+    void SetMovingArm(bool a_moving) { movingArm = a_moving; }
 
     void Reset() {
         weDrew          = false;
@@ -974,6 +1038,10 @@ namespace MTB::WeaponPreview {
         slowPhase       = 0;
         normalizeTried  = false;
         normalizeCapped = false;
+        // Fail SAFE, not fail QUIET: a stale true only withholds a stop event
+        // the standing case does not need, while a stale false sends one the
+        // moving case can never pay back.
+        movingArm       = false;
     }
 
     // DIAGNOSTIC ONLY. The CONTROL arm: the same dump on a weapon change made
@@ -1020,7 +1088,7 @@ namespace MTB::WeaponPreview {
             return;
         }
         auto* const state = a_player->AsActorState();
-        spdlog::debug("weapon diag: LIVE weapon change - right='{}' left='{}' ws={} drawn={}",
+        spdlog::debug("weapon diag: LIVE weapon change: right='{}' left='{}' ws={} drawn={}",
                       right && right->GetName() ? right->GetName() : "-",
                       leftFm && leftFm->GetName() ? leftFm->GetName() : "-",
                       state ? static_cast<int>(state->GetWeaponState()) : -1,
@@ -1152,11 +1220,11 @@ namespace MTB::WeaponPreview {
             const char* const skip = !enabled  ? "bWeaponPreviewInMenus=0"
                                    : inFlight  ? "our own transition is in flight"
                                                : nullptr;
-            spdlog::info("weapon preview: ARM EDGE - ws={} ({}){}", static_cast<int>(entryWs),
+            spdlog::info("weapon preview: ARM EDGE: ws={} ({}){}", static_cast<int>(entryWs),
                          terminal ? "terminal" : "MID-TRANSITION",
-                         skip ? fmt::format(" - normalize skipped, {}", skip)
-                              : (terminal ? " - nothing to normalize"
-                                          : " - normalizing now"));
+                         skip ? fmt::format("; normalize skipped, {}", skip)
+                              : (terminal ? "; nothing to normalize"
+                                          : "; normalizing now"));
             // NOT an early return. Everything below - swap detection, the
             // inFlight clear, the shield report - has to keep running whatever
             // the normalize decided; `inFlight` in particular is CLEARED below,
@@ -1168,7 +1236,7 @@ namespace MTB::WeaponPreview {
                     // this and declines to freeze the arm, so the clip the
                     // player started finishes on real frames instead of being
                     // held half-played and leaking past the menu.
-                    spdlog::info("weapon preview: normalize CAPPED - the draw/sheathe clip is "
+                    spdlog::info("weapon preview: normalize CAPPED: the draw/sheathe clip is "
                                  "longer than the {:.1f}s pump budget (replaced animation). "
                                  "Letting it finish on its own instead of retrying.",
                                  static_cast<float>(kPumpMaxSteps) * kPumpStep);
@@ -1186,7 +1254,7 @@ namespace MTB::WeaponPreview {
         if (normalizeCapped && (ws == RE::WEAPON_STATE::kSheathed ||
                                 ws == RE::WEAPON_STATE::kDrawn)) {
             normalizeCapped = false;
-            spdlog::info("weapon preview: the capped clip finished on its own (ws now {}) - "
+            spdlog::info("weapon preview: the capped clip finished on its own (ws now {}), "
                          "normal freeze resumes.", static_cast<int>(ws));
         }
 
@@ -1300,7 +1368,7 @@ namespace MTB::WeaponPreview {
                 }
                 spdlog::debug("weapon preview: drawing '{}'{}.",
                               weapon->GetName() ? weapon->GetName() : "?",
-                              arrived ? "" : " (pump CAPPED - re-parent fallback sent)");
+                              arrived ? "" : " (pump CAPPED, re-parent fallback sent)");
                 break;
             }
 
@@ -1431,7 +1499,7 @@ namespace MTB::WeaponPreview {
                         // that reports its own identity and its own budget
                         // costs one token and settles that in one grep.
                         spdlog::debug("weapon preview: slow swap r20a STARTED (cross-class "
-                                      "{}->{}) - sheathe issued, real frames from here "
+                                      "{}->{}), sheathe issued, real frames from here "
                                       "(per-phase cap {} frames).",
                                       shownType, newType, kSlowMaxFrames);
                     } else if (crossClass &&
@@ -1449,7 +1517,7 @@ namespace MTB::WeaponPreview {
                         // not contain it, and there was briefly no way to prove
                         // which build was deployed. A log line that names its
                         // own round settles that in one grep.
-                        spdlog::debug("weapon preview: r22 ARM B - cross-class {}->{} "
+                        spdlog::debug("weapon preview: r22 ARM B: cross-class {}->{} "
                                       "WITHOUT the sheathe detour (replace pump only).",
                                       shownType, newType);
                         PumpSwap(a_player);
@@ -1467,7 +1535,7 @@ namespace MTB::WeaponPreview {
                         // re-selects the idle, and its annotations re-attach the
                         // weapon and un-cull the shield on the way, so no hand
                         // placement is needed after it.
-                        spdlog::debug("weapon preview: r22 ARM A - cross-class {}->{} "
+                        spdlog::debug("weapon preview: r22 ARM A: cross-class {}->{} "
                                       "WITH the sheathe detour (r13 behaviour).",
                                       shownType, newType);
                         Draw(a_player, false);
@@ -1489,7 +1557,7 @@ namespace MTB::WeaponPreview {
                     }
                     const int oldType = shownType;
                     shownType         = newType;
-                    spdlog::debug("weapon preview: swap to '{}' - {} (moved={} type {}->{} "
+                    spdlog::debug("weapon preview: swap to '{}': {} (moved={} type {}->{} "
                                   "drawn={}).",
                                   weapon && weapon->GetName() ? weapon->GetName() : "?",
                                   crossClass ? "CROSS-CLASS redraw"

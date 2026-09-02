@@ -55,8 +55,15 @@ namespace MTB::EquipNotifyGate {
     // address and no exposure to the AE inlined-call-site trap.
     //
     // ⚠ We know of exactly ONE caller of Unk_B3 (inside Actor::OnItemEquipped).
-    // That is why this is scoped to the armed window and gated OFF by default
-    // rather than installed unconditionally.
+    // That is why this is scoped to the armed window rather than installed
+    // unconditionally.
+    //
+    // ⚠⚠ IT IS ON BY DEFAULT. This comment used to say "gated OFF by default",
+    // which was false: bLiveEquipNotifyInMenus defaults TRUE in Settings.h and
+    // the key is absent from the shipped INI, so every user runs with it on.
+    // The claim cost a bug hunt an afternoon, because a live path reads as a
+    // dead one when its own header says it is off. If the default changes,
+    // change this line with it.
 
     // Install the vfunc hook. Once per process; safe to call repeatedly.
     void Install();

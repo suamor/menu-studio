@@ -77,7 +77,7 @@ namespace MTB::ShadowPause {
     void Register() {
         auto* ui = RE::UI::GetSingleton();
         if (!ui) {
-            spdlog::error("ShadowPause: UI singleton unavailable - the studio "
+            spdlog::error("ShadowPause: UI singleton unavailable: the studio "
                           "cannot hold its own pause; Souls-live menus stay live.");
             return;
         }
@@ -95,7 +95,7 @@ namespace MTB::ShadowPause {
         }
         g_up = true;
         Post(RE::UI_MESSAGE_TYPE::kShow);
-        spdlog::info("ShadowPause: shown - the studio now holds a genuine pausing "
+        spdlog::info("ShadowPause: shown: the studio now holds a genuine pausing "
                      "menu, so the engine owns the pause bookkeeping.");
     }
 
@@ -105,7 +105,7 @@ namespace MTB::ShadowPause {
         }
         g_up = false;
         Post(RE::UI_MESSAGE_TYPE::kHide);
-        spdlog::info("ShadowPause: hidden - pause handed back to the engine.");
+        spdlog::info("ShadowPause: hidden: pause handed back to the engine.");
     }
 
     bool IsUp() { return g_up; }

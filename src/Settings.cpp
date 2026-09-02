@@ -15,6 +15,13 @@
 namespace {
     constexpr auto kIniPath = L"Data/SKSE/Plugins/MenuStudio.ini";
 
+#ifdef MENUSTUDIO_DIAG
+    // The camera probe's value as the reporter's own file had it, kept so a
+    // diagnostic build writes their setting back rather than its own. See the
+    // note at the end of Settings::Load.
+    bool g_diagProbeAsRead = true;
+#endif
+
     // Comma-separated INI list -> trimmed entries. Shared by sFreezeGraphBools
     // and the diagnostic's sDiagGraphVars; extracted rather than copied so the
     // two cannot drift in how they trim.
@@ -152,7 +159,7 @@ namespace {
             a_out.green = static_cast<std::uint8_t>(std::clamp(g, 0, 255));
             a_out.blue  = static_cast<std::uint8_t>(std::clamp(b, 0, 255));
         } else {
-            spdlog::warn("Settings: [{}] {} = '{}' is not R,G,B - ignored.", a_section, a_key, raw);
+            spdlog::warn("Settings: [{}] {} = '{}' is not R,G,B, ignored.", a_section, a_key, raw);
         }
     }
 }
@@ -193,7 +200,7 @@ namespace MTB {
             return false;
         }
         backdropDomeMesh        = bg->mesh;
-        backdropDomeRadius      = bg->radius;
+        backdropDomeRadius      = BackdropPolicy::ClampBackgroundRadius(bg->radius);
         backdropDomeZ           = bg->z;
         backdropBackground      = bg->name;
         backdropBackgroundImage = bg->image ? bg->image : "";
@@ -292,13 +299,23 @@ namespace MTB {
         CSimpleIniA ini;
         ini.SetUnicode();
         if (ini.LoadFile(kIniPath) < 0) {
-            spdlog::info("No MenuTimeBubble.ini - using defaults.");
+            spdlog::info("No MenuStudio.ini found; using defaults.");
         }
 
         enabled       = ini.GetBoolValue("General", "bEnabled", enabled);
+        waitForOwnerContext =
+            ini.GetBoolValue("General", "bWaitForOwnerContext", waitForOwnerContext);
         tickAnimation = ini.GetBoolValue("General", "bTickAnimation", tickAnimation);
         driveSmp      = ini.GetBoolValue("General", "bDriveSmp", driveSmp);
         tickFace      = ini.GetBoolValue("General", "bTickFace", tickFace);
+        tickCompanion = ini.GetBoolValue("General", "bTickCompanion", tickCompanion);
+        companionLungeGuard = ini.GetBoolValue("General", "bCompanionLungeGuard",
+                                               companionLungeGuard);
+        companionLungeRepeats = static_cast<int>(ini.GetLongValue(
+            "General", "iCompanionLungeRepeats", companionLungeRepeats));
+        companionProbe = ini.GetBoolValue("General", "bCompanionProbe", companionProbe);
+        companionProbeBone = ini.GetValue("General", "sCompanionProbeBone",
+                                          companionProbeBone.c_str());
         tickMagicCasters = ini.GetBoolValue("General", "bTickMagicCasters", tickMagicCasters);
         forcePause    = ini.GetBoolValue("General", "bForcePause", forcePause);
         // Auto-tick force-pause when Skyrim Souls is actually loaded (Fuzzles'
@@ -319,15 +336,104 @@ namespace MTB {
         if (ini.GetValue("General", "bForcePause", nullptr) == nullptr) {
             forcePause = soulsLoaded;
         }
-        spdlog::info("Skyrim Souls: {} - force-pause {}{}.",
+        spdlog::info("Skyrim Souls: {}, force-pause {}{}.",
                      soulsLoaded ? "SkyrimSoulsRE.dll loaded" : "not loaded",
                      forcePause ? "ON" : "OFF",
                      ini.GetValue("General", "bForcePause", nullptr) ? " (set in INI)"
                                                                     : " (auto)");
         shadowPause = ini.GetBoolValue("General", "bShadowPause", shadowPause);
         blockRightMouse = ini.GetBoolValue("General", "bBlockRightMouse", blockRightMouse);
+        actionBar  = ini.GetBoolValue("General", "bActionBar", actionBar);
+        actionBarX = static_cast<float>(
+            ini.GetDoubleValue("General", "fActionBarX", actionBarX));
+        actionBarY = static_cast<float>(
+            ini.GetDoubleValue("General", "fActionBarY", actionBarY));
+        // ⚠⚠ NO MIGRATION ON THIS KEY ANY MORE, AND IT NEEDS NONE. There was
+        // one for a day, to move installs off the carved default while auto was
+        // the answer. Auto is gone as of 2026-08-28 and carved is the default
+        // again, so every value already in the wild lands where it should: 1
+        // stays carved, 0 was auto and StyleFromIni reads it as carved, and a 2
+        // is a player who went and found plain.
+        frameStyle =
+            static_cast<int>(ini.GetLongValue("General", "iFrameStyle", frameStyle));
+        // ⚠ fPlainRounding IS NOT READ. The plain tile takes a fraction of its
+        // own width again, the way it did before the chamfer work; see
+        // Settings.h. Save() deletes the key, not Load, because Load never
+        // writes the file back and a Delete here would go with the local copy.
+        studioCamera = ini.GetBoolValue("General", "bStudioCamera", studioCamera);
+        cameraPivotNode = ini.GetValue("General", "sCameraPivotNode",
+                                       cameraPivotNode.c_str());
+        cameraOrbitSensitivity = static_cast<float>(ini.GetDoubleValue(
+            "General", "fCameraOrbitSensitivity", cameraOrbitSensitivity));
+        cameraTrackStep = static_cast<float>(
+            ini.GetDoubleValue("General", "fCameraTrackStep", cameraTrackStep));
+        cameraTrackSlack = static_cast<float>(
+            ini.GetDoubleValue("General", "fCameraTrackSlack", cameraTrackSlack));
+        cameraFocusMargin = static_cast<float>(
+            ini.GetDoubleValue("General", "fCameraFocusMargin", cameraFocusMargin));
+        cameraTrackLensSlope = static_cast<float>(ini.GetDoubleValue(
+            "General", "fCameraTrackLensSlope", cameraTrackLensSlope));
+        cameraAttachmentFill = static_cast<float>(ini.GetDoubleValue(
+            "General", "fCameraAttachmentFill", cameraAttachmentFill));
+        cameraTrackLateral = static_cast<float>(ini.GetDoubleValue(
+            "General", "fCameraTrackLateral", cameraTrackLateral));
+        cameraTrackBodyMid = static_cast<float>(ini.GetDoubleValue(
+            "General", "fCameraTrackBodyMid", cameraTrackBodyMid));
+        cameraTrackFaceHeight = static_cast<float>(ini.GetDoubleValue(
+            "General", "fCameraTrackFaceHeight", cameraTrackFaceHeight));
+        cameraPanSensitivity = static_cast<float>(ini.GetDoubleValue(
+            "General", "fCameraPanSensitivity", cameraPanSensitivity));
+        cameraPanRange = static_cast<float>(
+            ini.GetDoubleValue("General", "fCameraPanRange", cameraPanRange));
+        cameraPanRangeDown = static_cast<float>(ini.GetDoubleValue(
+            "General", "fCameraPanRangeDown", cameraPanRangeDown));
+        cameraSmoothing = static_cast<float>(
+            ini.GetDoubleValue("General", "fCameraSmoothing", cameraSmoothing));
+        cameraMinDistance = static_cast<float>(
+            ini.GetDoubleValue("General", "fCameraMinDistance", cameraMinDistance));
+        cameraOpenDistance = static_cast<float>(
+            ini.GetDoubleValue("General", "fCameraOpenDistance", cameraOpenDistance));
+        cameraMaxDistance = static_cast<float>(
+            ini.GetDoubleValue("General", "fCameraMaxDistance", cameraMaxDistance));
+        cameraZoneLeft = static_cast<float>(
+            ini.GetDoubleValue("General", "fCameraZoneLeft", cameraZoneLeft));
+        cameraZoneTop = static_cast<float>(
+            ini.GetDoubleValue("General", "fCameraZoneTop", cameraZoneTop));
+        cameraZoneRight = static_cast<float>(
+            ini.GetDoubleValue("General", "fCameraZoneRight", cameraZoneRight));
+        cameraZoneBottom = static_cast<float>(
+            ini.GetDoubleValue("General", "fCameraZoneBottom", cameraZoneBottom));
+        rememberFraming = ini.GetBoolValue("General", "bRememberFraming",
+                                           rememberFraming);
+        framingSaved = ini.GetBoolValue("General", "bFramingSaved", framingSaved);
+        framingYaw = static_cast<float>(
+            ini.GetDoubleValue("General", "fFramingYaw", framingYaw));
+        framingPitch = static_cast<float>(
+            ini.GetDoubleValue("General", "fFramingPitch", framingPitch));
+        framingZoom = static_cast<float>(
+            ini.GetDoubleValue("General", "fFramingZoom", framingZoom));
+        framingHeight = static_cast<float>(
+            ini.GetDoubleValue("General", "fFramingHeight", framingHeight));
+        framingLateral = static_cast<float>(
+            ini.GetDoubleValue("General", "fFramingLateral", framingLateral));
+        gridZoneLeft = static_cast<float>(
+            ini.GetDoubleValue("General", "fGridZoneLeft", gridZoneLeft));
+        gridZoneTop = static_cast<float>(
+            ini.GetDoubleValue("General", "fGridZoneTop", gridZoneTop));
+        gridZoneRight = static_cast<float>(
+            ini.GetDoubleValue("General", "fGridZoneRight", gridZoneRight));
+        gridZoneBottom = static_cast<float>(
+            ini.GetDoubleValue("General", "fGridZoneBottom", gridZoneBottom));
+        middleClickRecentre =
+            ini.GetBoolValue("General", "bMiddleClickRecentre", middleClickRecentre);
+        disableItemPreview3D =
+            ini.GetBoolValue("General", "bDisableItemPreview3D", disableItemPreview3D);
+        inspectNeedsHotkey =
+            ini.GetBoolValue("General", "bInspectNeedsHotkey", inspectNeedsHotkey);
         bypassCameraCollision =
             ini.GetBoolValue("General", "bBypassCameraCollision", bypassCameraCollision);
+        hideHudOverCustomMenus = ini.GetBoolValue(
+            "General", "bHideHudOverCustomMenus", hideHudOverCustomMenus);
         standardizeLighting =
             ini.GetBoolValue("Declutter", "bStandardizeLighting", standardizeLighting);
         studioLightWithoutSpace = ini.GetBoolValue(
@@ -354,7 +460,14 @@ namespace MTB {
         soloHideRadius = static_cast<float>(
             ini.GetDoubleValue("Declutter", "fSoloHideRadius", soloHideRadius));
         hideLightRefs = ini.GetBoolValue("Declutter", "bHideLightRefs", hideLightRefs);
+        hidePlayerForCompanion = ini.GetBoolValue("Declutter", "bHidePlayerForCompanion",
+                                                  hidePlayerForCompanion);
+        faceCompanionToCamera = ini.GetBoolValue("Declutter", "bFaceCompanionToCamera",
+                                                 faceCompanionToCamera);
+        companionFacingOffset = static_cast<float>(ini.GetDoubleValue(
+            "Declutter", "fCompanionFacingOffset", companionFacingOffset));
         cutCellLights = ini.GetBoolValue("Declutter", "bCutCellLights", cutCellLights);
+        cutSunLight   = ini.GetBoolValue("Declutter", "bCutSunLight", cutSunLight);
         voidEngine    = ini.GetBoolValue("Declutter", "bVoidEngine", voidEngine);
         if (const char* raw = ini.GetValue("General", "sFreezeGraphBools", nullptr);
             raw && *raw) {
@@ -372,6 +485,10 @@ namespace MTB {
             ini.GetBoolValue("General", "bLiveEquipNotifyInMenus", liveEquipNotifyInMenus);
         diagnosticProbes =
             ini.GetBoolValue("General", "bDiagnosticProbes", diagnosticProbes);
+        cameraCloseProbe =
+            ini.GetBoolValue("General", "bCameraCloseProbe", cameraCloseProbe);
+        playerCullProbe =
+            ini.GetBoolValue("General", "bPlayerCullProbe", playerCullProbe);
         faceMeshRefresh =
             ini.GetBoolValue("General", "bFaceMeshRefresh", faceMeshRefresh);
         freezeCharacter =
@@ -380,14 +497,8 @@ namespace MTB {
             ini.GetBoolValue("General", "bBlinkStressTest", blinkStressTest);
         pumpStopsAtIdle =
             ini.GetBoolValue("General", "bPumpStopsAtIdle", pumpStopsAtIdle);
-        clearIdleStartMarker =
-            ini.GetBoolValue("General", "bClearIdleStartMarker", clearIdleStartMarker);
-        applySettledMarker =
-            ini.GetBoolValue("General", "bApplySettledMarker", applySettledMarker);
         movingArmStandsAside =
             ini.GetBoolValue("General", "bMovingArmStandsAside", movingArmStandsAside);
-        freezeUnsettledPose =
-            ini.GetBoolValue("General", "bFreezeUnsettledPose", freezeUnsettledPose);
         freezeDrawSheathe =
             ini.GetBoolValue("General", "bFreezeDrawSheathe", freezeDrawSheathe);
         driveCbpc     = ini.GetBoolValue("General", "bDriveCbpc", driveCbpc);
@@ -398,6 +509,7 @@ namespace MTB {
             ini.GetBoolValue("General", "bAutoDrawInMenus", autoDrawInMenus);
         freezeHeadTracking =
             ini.GetBoolValue("General", "bFreezeHeadTracking", freezeHeadTracking);
+        limitedEditor = ini.GetBoolValue("General", "bLimitedEditor", limitedEditor);
         pinBodyHeading = ini.GetBoolValue("General", "bPinBodyHeading", pinBodyHeading);
         // F-16: iFaceInMenus (0 hold / 1 live / 2 neutral). Legacy
         // bNeutralExpression (<= 0.5.x) migrates when the new key is absent:
@@ -487,7 +599,7 @@ namespace MTB {
                            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         }
         if (!ApplyStagePreset(backdropStage)) {
-            spdlog::warn("Settings: [Backdrop] sStage='{}' unknown - using starlight.",
+            spdlog::warn("Settings: [Backdrop] sStage='{}' unknown, using starlight.",
                          backdropStage);
             ApplyStagePreset("starlight");
         }
@@ -508,9 +620,31 @@ namespace MTB {
             spdlog::info("Settings: migrated sBackground 'teat' -> 'aurora' "
                          "(same dome, the old key was Bethesda's filename).");
         }
+        // ⚠⚠ AN EMPTY sBackground MEANS blank, AND IT MEANT THE STAR DOME UNTIL
+        // 2026-08-28. The shipped template has carried `sBackground=` since the
+        // key existed, with a comment directly above it calling blank "THE
+        // DEFAULT, written here as an empty value", and tools/make_fomod.sh
+        // guards that empty value in every generated flavour as "no dome by
+        // default". None of the three was true. FindBackground("") matches no
+        // preset, so the lookup below failed and the fallback put every fresh
+        // install under constellation - a documented default that three
+        // separate places asserted and the code had never honoured.
+        //
+        // ⚠ RESOLVED HERE RATHER THAN IN THE TEMPLATE, because the template is
+        // only read on a FOMOD install. Every INI already on disk holds the
+        // empty value too, and a fix that only edits the shipped file leaves
+        // every existing player under the dome they never picked.
+        if (backdropBackground.empty()) {
+            backdropBackground = "blank";
+        }
         if (!ApplyBackgroundPreset(backdropBackground)) {
-            spdlog::warn("Settings: [Backdrop] sBackground='{}' unknown (blank/"
-                         "constellation) - using constellation.", backdropBackground);
+            // A NON-EMPTY name that resolves to nothing is a different case and
+            // keeps the old fallback: it is usually a backdrop pack the player
+            // has uninstalled, and dropping them onto a visible dome says so
+            // more loudly than dropping them onto an empty void would.
+            spdlog::warn("Settings: [Backdrop] sBackground='{}' matches no "
+                         "builtin or installed pack, using constellation.",
+                         backdropBackground);
             ApplyBackgroundPreset("constellation");
         }
         if (const char* raw = ini.GetValue("Backdrop", "sFloorMesh", nullptr); raw) {
@@ -540,7 +674,7 @@ namespace MTB {
                    "architecture\\solitude\\interiors\\slgcdome01.nif",
                    "architecture\\markarth\\mrktempledome01.nif" }) {
                 if (lowered == stale) {
-                    spdlog::info("Settings: sShellMesh '{}' is a retired shell - "
+                    spdlog::info("Settings: sShellMesh '{}' is a retired shell, "
                                  "migrated to the shipped voidshell.", backdropShellMesh);
                     backdropShellMesh = "mtb\\voidshell.nif";
                     break;
@@ -557,6 +691,9 @@ namespace MTB {
             ini.GetDoubleValue("Backdrop", "fDomeZ", backdropDomeZ));
         backdropBrightness = static_cast<float>(
             ini.GetDoubleValue("Backdrop", "fBrightness", backdropBrightness));
+        backdropImageBrightness = static_cast<float>(
+            ini.GetDoubleValue("Backdrop", "fImageBrightness", backdropImageBrightness));
+        backdropImageBrightness = std::clamp(backdropImageBrightness, 0.05f, 2.0f);
         voidBrightnessCap = static_cast<float>(
             ini.GetDoubleValue("Backdrop", "fVoidBrightnessCap", voidBrightnessCap));
         voidBrightnessCap = std::clamp(voidBrightnessCap, 0.02f, 0.35f);
@@ -566,7 +703,7 @@ namespace MTB {
             ini.GetDoubleValue("Backdrop", "fBackgroundYaw", backgroundYawOffset));
         backgroundYawOffset = std::clamp(backgroundYawOffset, -180.0f, 180.0f);
         backdropFloorRadius = std::clamp(backdropFloorRadius, 64.0f, 4096.0f);
-        backdropDomeRadius  = std::clamp(backdropDomeRadius, 256.0f, 12000.0f);
+        backdropDomeRadius  = BackdropPolicy::ClampBackgroundRadius(backdropDomeRadius);
         backdropFloorZ      = std::clamp(backdropFloorZ, -512.0f, 512.0f);
         backdropDomeZ       = std::clamp(backdropDomeZ, -4096.0f, 4096.0f);
         backdropBrightness  = std::clamp(backdropBrightness, 0.0f, 4.0f);
@@ -579,7 +716,7 @@ namespace MTB {
         }
         if (!ApplyLightPreset(lightPreset)) {
             spdlog::warn("Settings: [Lighting] sPreset='{}' unknown (studio/bright/warm/cool/"
-                         "dusk) - using studio values.", lightPreset);
+                         "dusk), using studio values.", lightPreset);
             ApplyLightPreset("studio");
         }
         ParseColor(ini, "rAmbient", lightAmbient);
@@ -674,6 +811,30 @@ namespace MTB {
             }
         }
 
+        // Strip buttons switched off, by id. Same comma-list shape as the sets
+        // above. An absent key leaves the set empty, which is every button
+        // showing - see the note on the field for why the OFF ids are the ones
+        // written down.
+        if (const char* raw = ini.GetValue("General", "sHiddenActions", nullptr);
+            raw && *raw) {
+            hiddenActions.clear();
+            std::string list{ raw };
+            std::size_t pos = 0;
+            while (pos <= list.size()) {
+                auto comma = list.find(',', pos);
+                if (comma == std::string::npos) {
+                    comma = list.size();
+                }
+                auto item = list.substr(pos, comma - pos);
+                const auto first = item.find_first_not_of(" \t");
+                const auto last = item.find_last_not_of(" \t");
+                if (first != std::string::npos) {
+                    hiddenActions.insert(item.substr(first, last - first + 1));
+                }
+                pos = comma + 1;
+            }
+        }
+
         if (const char* raw = ini.GetValue("General", "sMenus", nullptr); raw && *raw) {
             menus.clear();
             std::string list{ raw };
@@ -732,23 +893,66 @@ namespace MTB {
         // defaults stays silent, which is the common case.
         if (!liveEquipNotifyInMenus || crossClassSheatheRedraw || autoDrawInMenus ||
             slowSwapExperiment || diagnosticProbes) {
-            spdlog::info("Settings: weapon preview overrides - bLiveEquipNotifyInMenus={} "
+            spdlog::info("Settings: weapon preview overrides: bLiveEquipNotifyInMenus={} "
                          "bCrossClassSheatheRedraw={} bAutoDrawInMenus={} "
                          "bSlowSwapExperiment={} bDiagnosticProbes={}",
                          liveEquipNotifyInMenus, crossClassSheatheRedraw, autoDrawInMenus,
                          slowSwapExperiment, diagnosticProbes);
         }
+        // OS-103(b): its own line, because a probe you have to switch on by
+        // hand fails silently in exactly one way, and it is always the same
+        // one: the key never reached the loader and the absence of output reads
+        // as "no clears observed". This line is the difference between a
+        // measurement and a shrug.
+        if (playerCullProbe) {
+            // ⚠ THE PER-FRAME RE-CULL THIS USED TO ANNOUNCE IS GONE, since
+            // abacad8. Saying otherwise at the head of the log is worse than
+            // saying nothing: the phase tally below only counts culled-then-
+            // un-culled TRANSITIONS, and with nothing putting the flag back each
+            // frame it reads 0 whether the vfunc fix holds or not. Read the
+            // CullWatch trace instead, which records what each write left
+            // behind and needs no re-cull to mean anything.
+            spdlog::info("Settings: bPlayerCullProbe=true. The player-cull watch is ON while "
+                         "a framed companion holds the shot. Read the ordered "
+                         "'CullWatch: trip N ... left the flags word' lines and the 'last "
+                         "write that left him ON SCREEN' verdict under them. ⚠ The "
+                         "'declutter/probe: gap X -> Y' tallies count transitions only and "
+                         "read 0 once the flag stops being put back, so they cannot score "
+                         "the fix. Turn this back off after the round.");
+        }
         // Same rule for the face mesh bake: silent at its default, loud when
         // someone has turned the blink fix off.
         if (!faceMeshRefresh) {
-            spdlog::info("Settings: bFaceMeshRefresh=0 - the face MESH is NOT baked "
+            spdlog::info("Settings: bFaceMeshRefresh=0: the face MESH is NOT baked "
                          "while a menu is up; expect frozen eyes.");
         }
         if (freezeCharacter) {
-            spdlog::info("Settings: bFreezeCharacter=1 - the character holds the frame the "
+            spdlog::info("Settings: bFreezeCharacter=1: the character holds the frame the "
                          "menu caught (no graph, no settle, no face). Hair/cloth, body "
                          "physics and the weapon preview stay live.");
         }
+        // ⚠⚠ A DIAGNOSTIC BUILD FORCES ITS OWN INSTRUMENTS ON, LAST, AFTER THE
+        // WHOLE FILE HAS BEEN READ. A reporter's own INI wins over every code
+        // default ([[live-ini-overrides-code-defaults]]), so a diagnostic build
+        // that only changed defaults would come back with the log switched off
+        // and a wasted round trip. Asking them to edit two keys by hand is the
+        // same wasted round trip with extra steps.
+        //
+        // ⚠ bVerboseLog IS READ AND NEVER SAVED, so forcing it cannot reach
+        // their file. bCameraCloseProbe IS saved, so its original is kept and
+        // Save() writes that instead: a build handed out to answer one report
+        // must not leave a setting behind after they go back to the release.
+#ifdef MENUSTUDIO_DIAG
+        g_diagProbeAsRead = cameraCloseProbe;
+        verboseLog = true;
+        cameraCloseProbe = true;
+        spdlog::warn("Settings: DIAGNOSTIC BUILD. bVerboseLog and bCameraCloseProbe "
+                     "are forced ON in memory whatever MenuStudio.ini says (the file "
+                     "read bCameraCloseProbe={}), so this log is complete without "
+                     "anyone editing anything. Your saved setting is untouched. This "
+                     "build is for diagnosing one report and is not a release.",
+                     g_diagProbeAsRead);
+#endif
     }
 
     void Settings::Save() {
@@ -759,14 +963,34 @@ namespace MTB {
         ini.LoadFile(kIniPath);
 
         ini.SetBoolValue("General", "bEnabled", enabled);
-        ini.SetBoolValue("General", "bForcePause", forcePause);
+        ini.SetBoolValue("General", "bWaitForOwnerContext", waitForOwnerContext);
+        // ⚠ DELETED WHEN IT MATCHES THE DETECTION, never written back blind.
+        // The shipped INI leaves bForcePause ABSENT on purpose so Load() can
+        // derive it from SkyrimSoulsRE.dll (see 326-329). Save() runs after ANY
+        // control on ANY tab changes (SettingsUI.cpp:735-736), so writing the
+        // derived value back turned one unrelated slider drag into a permanent
+        // override. The bad direction is silent and sticky: a `false` pinned
+        // while Souls was absent goes on declining every bubble menu after Souls
+        // is installed, which reads in the field as "the action bar is just not
+        // there" - the studio never arms, so the window that carries it never
+        // opens (ActionBar.cpp:766).
+        //
+        // Same discipline the preset overrides already use below: a key that
+        // agrees with what detection would say does not need to exist.
+        if (forcePause == soulsLoaded) {
+            ini.Delete("General", "bForcePause", true);
+        } else {
+            ini.SetBoolValue("General", "bForcePause", forcePause);
+        }
         ini.SetBoolValue("General", "bTickAnimation", tickAnimation);
         ini.SetBoolValue("General", "bTickFace", tickFace);
+        ini.SetBoolValue("General", "bTickCompanion", tickCompanion);
         ini.SetBoolValue("General", "bTickMagicCasters", tickMagicCasters);
         ini.SetBoolValue("General", "bIdleInMenus", idleInMenus);
         ini.SetBoolValue("General", "bWeaponPreviewInMenus", weaponPreviewInMenus);
         ini.SetBoolValue("General", "bAutoDrawInMenus", autoDrawInMenus);
         ini.SetBoolValue("General", "bFreezeHeadTracking", freezeHeadTracking);
+        ini.SetBoolValue("General", "bLimitedEditor", limitedEditor);
         ini.SetLongValue("General", "iFaceInMenus", faceInMenus);
         ini.SetBoolValue("General", "bPreviewSpin", previewSpin);
         ini.SetBoolValue("General", "bOverrideSpimRotation", overrideSpimRotation);
@@ -788,19 +1012,94 @@ namespace MTB {
         ini.SetBoolValue("General", "bCrossClassSheatheRedraw", crossClassSheatheRedraw);
         ini.SetBoolValue("General", "bLiveEquipNotifyInMenus", liveEquipNotifyInMenus);
         ini.SetBoolValue("General", "bDiagnosticProbes", diagnosticProbes);
+        // ⚠ THE VALUE AS READ, NOT THE FORCED ONE. See the note at the end of
+        // Load: a diagnostic build must not persist its own instrument.
+#ifdef MENUSTUDIO_DIAG
+        ini.SetBoolValue("General", "bCameraCloseProbe", g_diagProbeAsRead);
+#else
+        ini.SetBoolValue("General", "bCameraCloseProbe", cameraCloseProbe);
+#endif
+        ini.SetBoolValue("Declutter", "bFaceCompanionToCamera", faceCompanionToCamera);
+        ini.SetDoubleValue("Declutter", "fCompanionFacingOffset", companionFacingOffset);
+        ini.SetBoolValue("General", "bPlayerCullProbe", playerCullProbe);
         ini.SetBoolValue("General", "bFaceMeshRefresh", faceMeshRefresh);
         ini.SetBoolValue("General", "bFreezeCharacter", freezeCharacter);
         ini.SetBoolValue("General", "bBlinkStressTest", blinkStressTest);
         ini.SetBoolValue("General", "bPumpStopsAtIdle", pumpStopsAtIdle);
-        ini.SetBoolValue("General", "bClearIdleStartMarker", clearIdleStartMarker);
-        ini.SetBoolValue("General", "bApplySettledMarker", applySettledMarker);
         ini.SetBoolValue("General", "bMovingArmStandsAside", movingArmStandsAside);
-        ini.SetBoolValue("General", "bFreezeUnsettledPose", freezeUnsettledPose);
         ini.SetBoolValue("General", "bFreezeDrawSheathe", freezeDrawSheathe);
         ini.SetBoolValue("General", "bDriveCbpc", driveCbpc);
         ini.SetBoolValue("General", "bShadowPause", shadowPause);
         ini.SetBoolValue("General", "bBlockRightMouse", blockRightMouse);
+        ini.SetBoolValue("General", "bActionBar", actionBar);
+        ini.SetDoubleValue("General", "fActionBarX", actionBarX);
+        ini.SetDoubleValue("General", "fActionBarY", actionBarY);
+        // ⚠ THE STAMP GOES IN ON EVERY SAVE even though nothing gates on it
+        // today. The frame migration it was added for is gone; the number stays
+        // so the next migration can tell a file written before it from one
+        // written after.
+        ini.SetLongValue("General", "iSettingsVersion",
+                         static_cast<long>(kSettingsVersion),
+                         "; which migrations this file has already been "
+                         "through. Do not edit.");
+        ini.SetLongValue("General", "iFrameStyle", frameStyle,
+                         "; corner shape for our own chrome: 1 carved (the "
+                         "default), 2 plain");
+        // ⚠ REMOVED RATHER THAN LEFT UNWRITTEN, the same rule fPlainRounding
+        // below is under. sCarvedPresets told auto which FLICK presets the carve
+        // was for, and auto is gone.
+        ini.Delete("General", "sCarvedPresets", true);
+        // ⚠ REMOVED RATHER THAN LEFT UNWRITTEN. Save() edits the file in place,
+        // so not setting a key leaves whatever was already on that line. Nothing
+        // reads fPlainRounding now and an editable line with nothing behind it
+        // is worse than no line. See Settings.h.
+        ini.Delete("General", "fPlainRounding", true);
+        ini.SetBoolValue("General", "bStudioCamera", studioCamera);
+        ini.SetValue("General", "sCameraPivotNode", cameraPivotNode.c_str());
+        ini.SetDoubleValue("General", "fCameraOrbitSensitivity", cameraOrbitSensitivity);
+        ini.SetDoubleValue("General", "fCameraTrackStep", cameraTrackStep);
+        ini.SetDoubleValue("General", "fCameraTrackSlack", cameraTrackSlack);
+        ini.SetDoubleValue("General", "fCameraFocusMargin", cameraFocusMargin);
+        ini.SetDoubleValue("General", "fCameraTrackLensSlope", cameraTrackLensSlope);
+        ini.SetDoubleValue("General", "fCameraAttachmentFill", cameraAttachmentFill);
+        ini.SetDoubleValue("General", "fCameraTrackLateral", cameraTrackLateral);
+        ini.SetDoubleValue("General", "fCameraTrackBodyMid", cameraTrackBodyMid);
+        ini.SetDoubleValue("General", "fCameraTrackFaceHeight", cameraTrackFaceHeight);
+        ini.SetDoubleValue("General", "fCameraPanSensitivity", cameraPanSensitivity);
+        ini.SetDoubleValue("General", "fCameraPanRange", cameraPanRange);
+        ini.SetDoubleValue("General", "fCameraPanRangeDown", cameraPanRangeDown);
+        ini.SetDoubleValue("General", "fCameraSmoothing", cameraSmoothing);
+        ini.SetDoubleValue("General", "fCameraMinDistance", cameraMinDistance);
+        ini.SetDoubleValue("General", "fCameraOpenDistance", cameraOpenDistance);
+        ini.SetDoubleValue("General", "fCameraMaxDistance", cameraMaxDistance);
+        ini.SetDoubleValue("General", "fCameraZoneLeft", cameraZoneLeft);
+        ini.SetDoubleValue("General", "fCameraZoneTop", cameraZoneTop);
+        ini.SetDoubleValue("General", "fCameraZoneRight", cameraZoneRight);
+        ini.SetDoubleValue("General", "fCameraZoneBottom", cameraZoneBottom);
+        // ⚠ THE SHOT ITSELF IS WRITTEN BY StudioCamera AT THE CLOSE, not by a
+        // panel control, so these five reach the file through this same
+        // load-modify-save like everything else. Only the toggle is a
+        // preference; the numbers are a recording of what the player did.
+        ini.SetBoolValue("General", "bRememberFraming", rememberFraming);
+        ini.SetBoolValue("General", "bFramingSaved", framingSaved);
+        ini.SetDoubleValue("General", "fFramingYaw", framingYaw);
+        ini.SetDoubleValue("General", "fFramingPitch", framingPitch);
+        ini.SetDoubleValue("General", "fFramingZoom", framingZoom);
+        ini.SetDoubleValue("General", "fFramingHeight", framingHeight);
+        ini.SetDoubleValue("General", "fFramingLateral", framingLateral);
+        ini.SetDoubleValue("General", "fGridZoneLeft", gridZoneLeft);
+        ini.SetDoubleValue("General", "fGridZoneTop", gridZoneTop);
+        ini.SetDoubleValue("General", "fGridZoneRight", gridZoneRight);
+        ini.SetDoubleValue("General", "fGridZoneBottom", gridZoneBottom);
+        ini.SetBoolValue("General", "bMiddleClickRecentre", middleClickRecentre);
+        ini.SetBoolValue("General", "bDisableItemPreview3D", disableItemPreview3D);
+        ini.SetBoolValue("General", "bInspectNeedsHotkey", inspectNeedsHotkey);
         ini.SetBoolValue("General", "bBypassCameraCollision", bypassCameraCollision);
+        ini.SetBoolValue("General", "bHideHudOverCustomMenus", hideHudOverCustomMenus,
+                         "; hide the compass and crosshair while the studio is armed "
+                         "over a menu that leaves the HUD drawing. The vanilla menus "
+                         "put the game in menu mode and the HUD stands itself down, "
+                         "so this only ever reaches another mod's own window");
         // CONFIGURED, never the effective value - saving while a no-space menu
         // is open must not persist that menu's temporary 0.
         ini.SetLongValue("Declutter", "iDeclutterMode", declutterModeIni);
@@ -809,8 +1108,11 @@ namespace MTB {
         // does not churn between saves.
         {
             std::string list;
+            // "RaceSex Menu" carries its space - the engine's own name. A
+            // member missing from THIS list is dropped on the next save even
+            // though it loads fine, which is a silent revert.
             for (const char* m : { "ContainerMenu", "BarterMenu", "InventoryMenu",
-                                   "MagicMenu" }) {
+                                   "MagicMenu", "GridInventoryMenu", "RaceSex Menu" }) {
                 if (spaceMenus.contains(m)) {
                     if (!list.empty()) {
                         list += ",";
@@ -822,13 +1124,42 @@ namespace MTB {
                          "; which menus get the void / dressing room (the rest keep "
                          "the normal world; pause + physics are unaffected)");
         }
+        // The Menus tab edits this now, so it has to round-trip or a tick would
+        // last exactly until the next Load().
+        //
+        // ⚠ THE SAME FIXED-ORDER RULE AS sSpaceMenus ABOVE, AND THE SAME TRAP:
+        // a member missing from THIS list loads fine and is dropped on the next
+        // save, which is a silent revert. 'RaceSex Menu' is therefore written
+        // even though the panel deliberately does not offer it - somebody who
+        // added it by hand must not lose it by opening the settings.
+        //
+        // ⚠ THE COMMENT ARGUMENT DOES NOT OVERWRITE AN EXISTING ONE. Measured
+        // against the deployed INI, which has been panel-saved many times and
+        // still carries the shipped block above sSpaceMenus in full. It is only
+        // used when the key is absent, which is the case on an INI that predates
+        // this key.
+        {
+            std::string list;
+            for (const char* m : { "ContainerMenu", "BarterMenu", "InventoryMenu",
+                                   "MagicMenu", "GridInventoryMenu", "RaceSex Menu" }) {
+                if (menus.contains(m)) {
+                    if (!list.empty()) {
+                        list += ",";
+                    }
+                    list += m;
+                }
+            }
+            ini.SetValue("General", "sMenus", list.c_str(),
+                         "; which menus Menu Studio takes at all (editable on the "
+                         "Menus tab; a change applies at the next open of that menu)");
+        }
         // §4b. Fixed emit order for the same reason as sSpaceMenus: the set is
         // unordered, so writing it in iteration order would churn the file on
         // every save.
         {
             std::string list;
             for (const char* m : { "ContainerMenu", "BarterMenu", "InventoryMenu",
-                                   "MagicMenu" }) {
+                                   "MagicMenu", "GridInventoryMenu" }) {
                 if (soulsLiveMenus.contains(m)) {
                     if (!list.empty()) {
                         list += ",";
@@ -841,9 +1172,29 @@ namespace MTB {
                          "unpaused (no studio); the rest are paused so the studio "
                          "works. Empty = studio in all of them");
         }
+        // The buttons switched off. SORTED rather than emitted in a fixed list
+        // like the two above, because those know every member at compile time
+        // and this one cannot: any plugin may register an id. Sorting is what
+        // keeps an unordered set from rewriting the line in a new order on
+        // every save, which is the same churn the fixed orders exist to avoid.
+        {
+            std::vector<std::string> ids(hiddenActions.begin(), hiddenActions.end());
+            std::sort(ids.begin(), ids.end());
+            std::string list;
+            for (const auto& id : ids) {
+                if (!list.empty()) {
+                    list += ",";
+                }
+                list += id;
+            }
+            ini.SetValue("General", "sHiddenActions", list.c_str(),
+                         "; buttons hidden from the on-screen strip, by id. Empty = "
+                         "every button shows, including ones added by other mods");
+        }
         ini.SetBoolValue("Declutter", "bStandardizeLighting", standardizeLighting);
         ini.SetBoolValue("Declutter", "bStudioLightWithoutSpace", studioLightWithoutSpace);
         ini.SetBoolValue("Declutter", "bCutCellLights", cutCellLights);
+        ini.SetBoolValue("Declutter", "bCutSunLight", cutSunLight);
         ini.SetBoolValue("Declutter", "bVoidEngine", voidEngine);
         {
             std::string joined;
@@ -897,6 +1248,7 @@ namespace MTB {
         diffFloat("fDomeZ", backdropDomeZ, activeBg != nullptr,
                   activeBg ? activeBg->z : 0.0f);
         ini.SetDoubleValue("Backdrop", "fBrightness", backdropBrightness);
+        ini.SetDoubleValue("Backdrop", "fImageBrightness", backdropImageBrightness);
         ini.SetBoolValue("Backdrop", "bLockBackgroundAngle", backgroundFaceCamera);
         ini.SetDoubleValue("Backdrop", "fBackgroundYaw", backgroundYawOffset);
         ini.SetValue("Lighting", "sPreset", lightPreset.c_str());

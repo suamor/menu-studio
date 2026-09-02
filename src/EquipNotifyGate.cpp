@@ -23,7 +23,7 @@ namespace MTB::EquipNotifyGate {
                     // path and a per-call line would bury the very clip lines
                     // it exists to explain.
                     if (!g_loggedThisSession.exchange(true, std::memory_order_relaxed)) {
-                        spdlog::info("equip notify gate: r25 ACTIVE - answering Unk_B3 'do not "
+                        spdlog::info("equip notify gate: r25 ACTIVE, answering Unk_B3 'do not "
                                      "bail', so Actor::OnItemEquipped runs its re-parent and "
                                      "graph notifications instead of being short-circuited by "
                                      "our own kPausesGame menu.");

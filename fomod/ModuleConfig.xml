@@ -3,13 +3,39 @@
 	<moduleName>Menu Studio</moduleName>
 	<moduleImage path="Images\menustudio.png"/>
 
-	<!-- One universal DLL (SE 1.5.97 and AE 1.6.1130+) and no install options:
-	     everything installs together, settings INI included, and every setting
-	     stays changeable in game from the panel or the INI. Game files ONLY
-	     here: the docs (LICENSE/README/CHANGELOG/KNOWN-ISSUES/
-	     THIRD-PARTY-NOTICES) ship at the archive root, NOT installed to Data -
-	     flat docs at the Data root collide across mods and show as overwrite
-	     conflicts in MO2. -->
+	<!-- One universal DLL (SE 1.5.97 and AE 1.6.1130+), so there is no SE/AE
+	     file choice and never will be.
+
+	     ⚠⚠ EVERY CHOICE BELOW IS STARTING SETTINGS AND NOTHING ELSE. The
+	     installer picks which MenuStudio.ini is written and changes nothing
+	     about which files land. Every key it sets stays changeable in game
+	     from the panel or the INI a second later. An install choice that
+	     gated a file would quietly own something the panel appears to own,
+	     which is the trap the sibling repo's FOMOD documents at length.
+
+	     TWO questions, the scene and the background, so twenty starting INIs
+	     and one conditionalFileInstalls block at the bottom to choose between
+	     them. Neither page installs a file of its own; see the note above that
+	     block for why that is not tidiness.
+
+	     ⚠⚠ THE BACKGROUND PAGE WAS REMOVED ON 2026-08-27 AND IS BACK (user
+	     2026-08-28). It went on the argument that a page which only writes a
+	     setting the panel owns makes a permanent-looking decision out of a tick.
+	     That argument was right about the item-preview page, which is still gone,
+	     and wrong about this one. The five backgrounds are the mod's whole
+	     subject, they now have a picture each, and a catalogue a player can look
+	     at is worth more than the tick it saves them. The floating item preview
+	     stays out: it had nothing to show and no answer worth asking for.
+
+	     ⚠ THE DEFAULT IS blank, AND THE CODE ONLY STARTED HONOURING THAT ON
+	     2026-08-28. An empty sBackground matched no preset, so Settings::Load
+	     fell through to constellation and every install so far has come up under
+	     the star dome. See the note above the empty check in Settings.cpp.
+
+	     Game files ONLY in requiredInstallFiles: LICENSE and the short
+	     README ship at the archive root and are NOT installed to Data,
+	     because flat docs at the Data root collide across mods and show as
+	     overwrite conflicts in MO2. -->
 	<requiredInstallFiles>
 		<folder source="core\SKSE" destination="SKSE" priority="0"/>
 		<folder source="core\meshes" destination="meshes" priority="0"/>
@@ -17,19 +43,189 @@
 	</requiredInstallFiles>
 
 	<installSteps order="Explicit">
-		<installStep name="Menu Studio">
+		<installStep name="The scene behind your character">
 			<optionalFileGroups order="Explicit">
-				<group name="Thanks for installing" type="SelectAny">
+				<group name="What you see when a menu opens (a setting, change it any time)" type="SelectExactlyOne">
 					<plugins order="Explicit">
-						<plugin name="Enjoy, and please endorse if you like the mod">
-							<description>Menu Studio pauses the world the moment you open a menu but keeps your character alive and posed, then stages the scene around them, from a clean void to a lit dressing room, so you can actually look at your character. It covers the inventory, barter, container and magic menus, and everything is optional and configurable from the in-game panel or the INI.
+						<plugin name="A clean void">
+							<description>The room goes and your character stands in the dark under studio lighting. No floor, no set, just the light.
 
-You need a "show player in menus" mod (such as Show Player In Menus or Show Player In Inventory) so there is a character to frame, and a physics mod (Faster HDT-SMP or CBPC) is recommended so hair and cloth keep moving while the menu is paused.
+This is what the mod was built to do.</description>
+							<image path="Images\scene-void.png"/>
+							<files/>
+							<conditionFlags>
+								<flag name="scene">void</flag>
+							</conditionFlags>
+							<typeDescriptor>
+								<type name="Recommended"/>
+							</typeDescriptor>
+						</plugin>
+						<plugin name="The dressing room">
+							<description>The void with a stage in it: a floor, a dome, set pieces and a colour over the whole thing.
 
-Source, docs and issue tracker: https://github.com/maartenharms/menu-studio
+Pick this if you would rather your character had somewhere to stand. You can build your own backdrop; there is an example to copy in SKSE\Plugins\MenuStudio\Backdrops.</description>
+							<image path="Images\scene-dressing-room.png"/>
+							<files/>
+							<conditionFlags>
+								<flag name="scene">stage</flag>
+							</conditionFlags>
+							<typeDescriptor>
+								<type name="Optional"/>
+							</typeDescriptor>
+						</plugin>
+						<plugin name="Just you and the room">
+							<description>The crowd and the clutter go, the room stays. Alone in the tavern rather than alone in a void.
 
-Thanks for installing, and if you enjoy it, a kind endorsement is always appreciated.</description>
-							<image path="Images\menustudio.png"/>
+Pick this if the place matters to you and the people in it do not.</description>
+							<image path="Images\scene-just-you.png"/>
+							<files/>
+							<conditionFlags>
+								<flag name="scene">solo</flag>
+							</conditionFlags>
+							<typeDescriptor>
+								<type name="Optional"/>
+							</typeDescriptor>
+						</plugin>
+						<plugin name="Leave the world where it is">
+							<description>The menu opens on whatever is around you. The world still pauses and your character still breathes, nothing is cleared away.
+
+The lightest of the four, because nothing is hidden and nothing is built.</description>
+							<image path="Images\scene-world.png"/>
+							<files/>
+							<conditionFlags>
+								<flag name="scene">off</flag>
+							</conditionFlags>
+							<typeDescriptor>
+								<type name="Optional"/>
+							</typeDescriptor>
+						</plugin>
+					</plugins>
+				</group>
+			</optionalFileGroups>
+		</installStep>
+
+		<installStep name="The background behind your character">
+			<!-- ⚠ THE PICKER IN THE PANEL IS STILL THE LAST WORD, and it lists more
+			     than these five: any backdrop pack under
+			     SKSE\Plugins\MenuStudio\Backdrops shows up there too. This page
+			     picks a starting value out of the five that ship. -->
+			<optionalFileGroups order="Explicit">
+				<group name="What's behind your character (a setting, change it any time)" type="SelectExactlyOne">
+					<plugins order="Explicit">
+						<plugin name="No dome, just colour">
+							<description>Nothing behind your character but flat colour. It follows the time of day, or you can pin it in the panel.
+
+The default, and the one that stays out of the way of the outfit.</description>
+							<image path="Images\dome-blank.png"/>
+							<files/>
+							<conditionFlags>
+								<flag name="background">blank</flag>
+							</conditionFlags>
+							<typeDescriptor>
+								<type name="Recommended"/>
+							</typeDescriptor>
+						</plugin>
+						<plugin name="The star dome">
+							<description>The skills menu's constellations, wrapped around your character.</description>
+							<image path="Images\dome-stars.png"/>
+							<files/>
+							<conditionFlags>
+								<flag name="background">constellation</flag>
+							</conditionFlags>
+							<typeDescriptor>
+								<type name="Optional"/>
+							</typeDescriptor>
+						</plugin>
+						<plugin name="The vampire dome">
+							<description>Dawnguard's vampire constellations. Darker and redder than the other two.
+
+Needs Dawnguard. Without it the dome does not load and you get the plain void.</description>
+							<image path="Images\dome-vampire.png"/>
+							<files/>
+							<conditionFlags>
+								<flag name="background">vampire</flag>
+							</conditionFlags>
+							<typeDescriptor>
+								<type name="Optional"/>
+							</typeDescriptor>
+						</plugin>
+						<plugin name="The aurora dome">
+							<description>The third vanilla perk sky. Green and blue curtains rather than stars.</description>
+							<image path="Images\dome-aurora.png"/>
+							<files/>
+							<conditionFlags>
+								<flag name="background">aurora</flag>
+							</conditionFlags>
+							<typeDescriptor>
+								<type name="Optional"/>
+							</typeDescriptor>
+						</plugin>
+						<plugin name="My own picture">
+							<description>Your picture wrapped all the way around instead of a dome. A nebula ships as the example.
+
+Drop any 2:1 image over textures\mtb\voidshell_g.dds to use your own. Lock background angle in the panel keeps it framed the same way every time.</description>
+							<image path="Images\dome-custom.png"/>
+							<files/>
+							<conditionFlags>
+								<flag name="background">custom</flag>
+							</conditionFlags>
+							<typeDescriptor>
+								<type name="Optional"/>
+							</typeDescriptor>
+						</plugin>
+					</plugins>
+				</group>
+			</optionalFileGroups>
+		</installStep>
+
+		<installStep name="Before you play">
+			<!-- ⚠ ONE PICTURE ACROSS ALL FOUR, ON PURPOSE. None of them is a choice:
+			     the step sets no flag and installs no file, so a reader has nothing to
+			     tell apart and four near-identical frames would only ask them to try. -->
+			<optionalFileGroups order="Explicit">
+				<group name="What Menu Studio needs, and what goes well with it" type="SelectAny">
+					<plugins order="Explicit">
+						<plugin name="What this mod does">
+							<description>Open a menu and the world pauses, but your character keeps breathing and stays posed, with a scene built around them. Inventory, barter, container and magic menus.
+
+Everything here is a setting. The in-game panel owns all of it.
+
+https://www.nexusmods.com/skyrimspecialedition/mods/185362</description>
+							<image path="Images\before-you-play.png"/>
+							<files/>
+							<typeDescriptor>
+								<type name="Optional"/>
+							</typeDescriptor>
+						</plugin>
+						<plugin name="You need a show-player-in-menus mod">
+							<description>Menu Studio frames your character in menus, so something has to put your character on screen in the first place. Show Player In Menus or Show Player In Inventory both do it.
+
+Without one of those you get the staging and the pause, and nothing to look at.
+
+A physics mod is recommended alongside it, Faster HDT-SMP or CBPC, so hair and cloth keep moving while the menu is paused. Without one, everything simply hangs still, which still works and looks less alive.</description>
+							<image path="Images\before-you-play.png"/>
+							<files/>
+							<typeDescriptor>
+								<type name="Optional"/>
+							</typeDescriptor>
+						</plugin>
+						<plugin name="An interface mod I recommend">
+							<description>Menu Studio puts your character on the right of the screen, which is where the vanilla inventory already puts the item card and the floating preview.
+
+A Vel'dun-style interface layout moves both well clear of them. Not required, not a dependency.
+
+If you would rather not add an interface mod, the panel can hide the floating preview instead.</description>
+							<image path="Images\before-you-play.png"/>
+							<files/>
+							<typeDescriptor>
+								<type name="Optional"/>
+							</typeDescriptor>
+						</plugin>
+						<plugin name="Enjoy, and please endorse if you like it">
+							<description>Thanks for installing. An endorsement is always appreciated if you enjoy it.
+
+These pages set two starting values and nothing else. Nothing was added or left out, and the panel can change both whenever you like.</description>
+							<image path="Images\before-you-play.png"/>
 							<files/>
 							<typeDescriptor>
 								<type name="Optional"/>
@@ -40,4 +236,201 @@ Thanks for installing, and if you enjoy it, a kind endorsement is always appreci
 			</optionalFileGroups>
 		</installStep>
 	</installSteps>
+
+	<!-- ⚠⚠ NEITHER PAGE INSTALLS A FILE, because both answers are lines in
+	     MenuStudio.ini and the DLL writes that file too. As a folder install
+	     either one would race the plugin's own copy. tools/make_fomod.sh generates
+	     one INI per combination and exactly one is picked here.
+
+	     ⚠⚠ THE TWO AXES ARE INDEPENDENT, so the INI is chosen by the PAIR of
+	     answers rather than by either one alone. Four scenes times five
+	     backgrounds is twenty, and all twenty are below: a missing pair would
+	     install no INI at all, which is survivable because the plugin writes its
+	     own on first run, and would silently ignore the player's answers, which is
+	     not. The block is GENERATED from the two lists, because a hand-typed
+	     twentieth pattern is where "all of them are covered" stops being true. -->
+	<conditionalFileInstalls>
+		<patterns>
+			<pattern>
+				<dependencies operator="And">
+					<flagDependency flag="scene" value="void"/>
+					<flagDependency flag="background" value="blank"/>
+				</dependencies>
+				<files>
+					<file source="settings\void-blank\MenuStudio.ini" destination="SKSE\Plugins\MenuStudio.ini" priority="1"/>
+				</files>
+			</pattern>
+			<pattern>
+				<dependencies operator="And">
+					<flagDependency flag="scene" value="void"/>
+					<flagDependency flag="background" value="constellation"/>
+				</dependencies>
+				<files>
+					<file source="settings\void-constellation\MenuStudio.ini" destination="SKSE\Plugins\MenuStudio.ini" priority="1"/>
+				</files>
+			</pattern>
+			<pattern>
+				<dependencies operator="And">
+					<flagDependency flag="scene" value="void"/>
+					<flagDependency flag="background" value="vampire"/>
+				</dependencies>
+				<files>
+					<file source="settings\void-vampire\MenuStudio.ini" destination="SKSE\Plugins\MenuStudio.ini" priority="1"/>
+				</files>
+			</pattern>
+			<pattern>
+				<dependencies operator="And">
+					<flagDependency flag="scene" value="void"/>
+					<flagDependency flag="background" value="aurora"/>
+				</dependencies>
+				<files>
+					<file source="settings\void-aurora\MenuStudio.ini" destination="SKSE\Plugins\MenuStudio.ini" priority="1"/>
+				</files>
+			</pattern>
+			<pattern>
+				<dependencies operator="And">
+					<flagDependency flag="scene" value="void"/>
+					<flagDependency flag="background" value="custom"/>
+				</dependencies>
+				<files>
+					<file source="settings\void-custom\MenuStudio.ini" destination="SKSE\Plugins\MenuStudio.ini" priority="1"/>
+				</files>
+			</pattern>
+			<pattern>
+				<dependencies operator="And">
+					<flagDependency flag="scene" value="stage"/>
+					<flagDependency flag="background" value="blank"/>
+				</dependencies>
+				<files>
+					<file source="settings\stage-blank\MenuStudio.ini" destination="SKSE\Plugins\MenuStudio.ini" priority="1"/>
+				</files>
+			</pattern>
+			<pattern>
+				<dependencies operator="And">
+					<flagDependency flag="scene" value="stage"/>
+					<flagDependency flag="background" value="constellation"/>
+				</dependencies>
+				<files>
+					<file source="settings\stage-constellation\MenuStudio.ini" destination="SKSE\Plugins\MenuStudio.ini" priority="1"/>
+				</files>
+			</pattern>
+			<pattern>
+				<dependencies operator="And">
+					<flagDependency flag="scene" value="stage"/>
+					<flagDependency flag="background" value="vampire"/>
+				</dependencies>
+				<files>
+					<file source="settings\stage-vampire\MenuStudio.ini" destination="SKSE\Plugins\MenuStudio.ini" priority="1"/>
+				</files>
+			</pattern>
+			<pattern>
+				<dependencies operator="And">
+					<flagDependency flag="scene" value="stage"/>
+					<flagDependency flag="background" value="aurora"/>
+				</dependencies>
+				<files>
+					<file source="settings\stage-aurora\MenuStudio.ini" destination="SKSE\Plugins\MenuStudio.ini" priority="1"/>
+				</files>
+			</pattern>
+			<pattern>
+				<dependencies operator="And">
+					<flagDependency flag="scene" value="stage"/>
+					<flagDependency flag="background" value="custom"/>
+				</dependencies>
+				<files>
+					<file source="settings\stage-custom\MenuStudio.ini" destination="SKSE\Plugins\MenuStudio.ini" priority="1"/>
+				</files>
+			</pattern>
+			<pattern>
+				<dependencies operator="And">
+					<flagDependency flag="scene" value="solo"/>
+					<flagDependency flag="background" value="blank"/>
+				</dependencies>
+				<files>
+					<file source="settings\solo-blank\MenuStudio.ini" destination="SKSE\Plugins\MenuStudio.ini" priority="1"/>
+				</files>
+			</pattern>
+			<pattern>
+				<dependencies operator="And">
+					<flagDependency flag="scene" value="solo"/>
+					<flagDependency flag="background" value="constellation"/>
+				</dependencies>
+				<files>
+					<file source="settings\solo-constellation\MenuStudio.ini" destination="SKSE\Plugins\MenuStudio.ini" priority="1"/>
+				</files>
+			</pattern>
+			<pattern>
+				<dependencies operator="And">
+					<flagDependency flag="scene" value="solo"/>
+					<flagDependency flag="background" value="vampire"/>
+				</dependencies>
+				<files>
+					<file source="settings\solo-vampire\MenuStudio.ini" destination="SKSE\Plugins\MenuStudio.ini" priority="1"/>
+				</files>
+			</pattern>
+			<pattern>
+				<dependencies operator="And">
+					<flagDependency flag="scene" value="solo"/>
+					<flagDependency flag="background" value="aurora"/>
+				</dependencies>
+				<files>
+					<file source="settings\solo-aurora\MenuStudio.ini" destination="SKSE\Plugins\MenuStudio.ini" priority="1"/>
+				</files>
+			</pattern>
+			<pattern>
+				<dependencies operator="And">
+					<flagDependency flag="scene" value="solo"/>
+					<flagDependency flag="background" value="custom"/>
+				</dependencies>
+				<files>
+					<file source="settings\solo-custom\MenuStudio.ini" destination="SKSE\Plugins\MenuStudio.ini" priority="1"/>
+				</files>
+			</pattern>
+			<pattern>
+				<dependencies operator="And">
+					<flagDependency flag="scene" value="off"/>
+					<flagDependency flag="background" value="blank"/>
+				</dependencies>
+				<files>
+					<file source="settings\off-blank\MenuStudio.ini" destination="SKSE\Plugins\MenuStudio.ini" priority="1"/>
+				</files>
+			</pattern>
+			<pattern>
+				<dependencies operator="And">
+					<flagDependency flag="scene" value="off"/>
+					<flagDependency flag="background" value="constellation"/>
+				</dependencies>
+				<files>
+					<file source="settings\off-constellation\MenuStudio.ini" destination="SKSE\Plugins\MenuStudio.ini" priority="1"/>
+				</files>
+			</pattern>
+			<pattern>
+				<dependencies operator="And">
+					<flagDependency flag="scene" value="off"/>
+					<flagDependency flag="background" value="vampire"/>
+				</dependencies>
+				<files>
+					<file source="settings\off-vampire\MenuStudio.ini" destination="SKSE\Plugins\MenuStudio.ini" priority="1"/>
+				</files>
+			</pattern>
+			<pattern>
+				<dependencies operator="And">
+					<flagDependency flag="scene" value="off"/>
+					<flagDependency flag="background" value="aurora"/>
+				</dependencies>
+				<files>
+					<file source="settings\off-aurora\MenuStudio.ini" destination="SKSE\Plugins\MenuStudio.ini" priority="1"/>
+				</files>
+			</pattern>
+			<pattern>
+				<dependencies operator="And">
+					<flagDependency flag="scene" value="off"/>
+					<flagDependency flag="background" value="custom"/>
+				</dependencies>
+				<files>
+					<file source="settings\off-custom\MenuStudio.ini" destination="SKSE\Plugins\MenuStudio.ini" priority="1"/>
+				</files>
+			</pattern>
+		</patterns>
+	</conditionalFileInstalls>
 </config>

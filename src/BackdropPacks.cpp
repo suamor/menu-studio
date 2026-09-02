@@ -18,18 +18,38 @@ namespace {
 
     // Built-in backgrounds/stages (moved verbatim from Settings.cpp; their const
     // char* are string literals, so they are stable without interning).
+    // Every builtin carries a card picture baked or drawn by
+    // tools/bake_shipped_thumbs.py. The star domes get a curated layer of
+    // their own texture stack (the first-texture heuristic gave constellation
+    // and vampire the same star tile); blank and custom get DRAWN tiles (a
+    // flat void-dark card and a muted spectrum band), because the field asked
+    // for cards there too and neither has a texture to photograph. The thumb
+    // path spells the preset NAME; the bake script keeps the same rule, and
+    // that path is the only place the two sides meet. A missing PNG degrades
+    // to the named tile through the picker's loader, so a stale bake cannot
+    // break the panel.
     constexpr std::array<BackgroundPreset, 5> kBuiltinBackgrounds{ {
-        { "blank", "mtb\\voidcolor.nif", 2000.0f, 0.0f, "", false, 0.0f },
-        { "constellation", "interface\\intperkskydome.nif", 2000.0f, 0.0f, "", false, 0.0f },
-        { "vampire", "dlc01\\interface\\intvampireperkskydome.nif", 2000.0f, 0.0f, "", false, 0.0f },
+        { "blank", "mtb\\voidcolor.nif", BackdropPolicy::kBackgroundRadiusDefault,
+          0.0f, "", false, 0.0f,
+          "", "mtb\\backdrops\\shipped\\blank.png" },
+        { "constellation", "interface\\intperkskydome.nif",
+          BackdropPolicy::kBackgroundRadiusDefault, 0.0f, "", false, 0.0f,
+          "", "mtb\\backdrops\\shipped\\constellation.png" },
+        { "vampire", "dlc01\\interface\\intvampireperkskydome.nif",
+          BackdropPolicy::kBackgroundRadiusDefault, 0.0f, "", false, 0.0f,
+          "", "mtb\\backdrops\\shipped\\vampire.png" },
         // The MESH NAME is not a typo on our side and must not be "corrected":
         // Bethesda really did ship `interface\teatperkskydome.nif` in
         // Skyrim - Meshes1.bsa. Only the user-facing key was ever wrong, since
         // it was taken straight from the filename and then shown in the panel
         // and the INI. Renamed to "aurora"; the path stays verbatim or the
         // dome stops resolving. Settings::Load migrates the old stored value.
-        { "aurora", "interface\\teatperkskydome.nif", 2000.0f, 0.0f, "", false, 0.0f },
-        { "custom", "mtb\\voidimage.nif", 2000.0f, 0.0f, "", false, 0.0f },
+        { "aurora", "interface\\teatperkskydome.nif",
+          BackdropPolicy::kBackgroundRadiusDefault, 0.0f, "", false, 0.0f,
+          "", "mtb\\backdrops\\shipped\\aurora.png" },
+        { "custom", "mtb\\voidimage.nif", BackdropPolicy::kBackgroundRadiusDefault,
+          0.0f, "", false, 0.0f,
+          "", "mtb\\backdrops\\shipped\\custom.png" },
     } };
     constexpr std::array<StagePreset, 1> kBuiltinStages{ {
         { "starlight", "clutter\\nightingale\\nightingaleplatform.nif", 600.0f, -10.0f, {} },
@@ -121,25 +141,26 @@ namespace MTB::BackdropPacks {
                         g_authorByName[pack.name] = pack.author;
                     }
 
-                    if (pack.hasBackground) {
+                    const char* group = pack.group.empty() ? "" : Intern(pack.group);
+                    for (const auto& parsed : pack.backgrounds) {
                         BackgroundPreset bg{};
-                        bg.name = name;
-                        if (!pack.bgImage.empty()) {
+                        bg.name = Intern(parsed.name);
+                        if (!parsed.image.empty()) {
                             bg.mesh = kImageSphereMesh;
-                            bg.image = Intern(pack.bgImage);
-                            spdlog::warn("BackdropPacks: '{}' uses image=; a per-pack "
-                                         "custom image is not supported in this build, so it "
-                                         "shows the default sphere. Ship a dome=<nif> pointed "
-                                         "at your texture for a custom image (see the readme).",
-                                         fileLabel);
+                            bg.image = Intern(parsed.image);
                         } else {
-                            bg.mesh = Intern(pack.bgDome);
+                            bg.mesh = Intern(parsed.dome);
                             bg.image = "";
                         }
-                        bg.radius = pack.bgRadius;
-                        bg.z = pack.bgZ;
-                        bg.faceCamera = pack.bgFaceCamera;
-                        bg.yaw = pack.bgYaw;
+                        bg.radius = parsed.radius;
+                        bg.z = parsed.z;
+                        bg.faceCamera = parsed.faceCamera;
+                        bg.yaw = parsed.yaw;
+                        bg.group = group;
+                        bg.thumb = parsed.thumb.empty() ? "" : Intern(parsed.thumb);
+                        if (!pack.author.empty()) {
+                            g_authorByName[parsed.name] = pack.author;
+                        }
                         g_backgrounds.push_back(bg);
                     }
 
@@ -171,6 +192,10 @@ namespace MTB::BackdropPacks {
 
     std::span<const BackgroundPreset> Backgrounds() {
         return g_backgrounds;
+    }
+
+    std::size_t BuiltinBackgroundCount() {
+        return kBuiltinBackgrounds.size();
     }
 
     std::span<const StagePreset> Stages() {

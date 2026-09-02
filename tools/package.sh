@@ -24,6 +24,18 @@ sed 's/^bVerboseLog=1/bVerboseLog=0/' \
 cp -r "$ROOT/dist/meshes"   "$STAGE/meshes"
 cp -r "$ROOT/dist/textures" "$STAGE/textures"
 find "$STAGE/textures" -iname "*.png" -delete
+# ⚠⚠ THE CORNER ART, AND IT HAS NEVER BEEN IN A RELEASE ZIP. FrameArt loads
+# frame.png and frame_fill.png from here; without them it returns 0 and every
+# carved surface silently falls back to the straight bevel, which is a different
+# shape from the scooped art corner and is the whole look people install this
+# for. It was survivable while iFrameStyle defaulted to auto, because a player
+# not running Vel'dun drew plain and never asked for the art. Carved is the
+# default now, so a zip without these renders wrong for everyone.
+#
+# ⚠ COPIED AFTER THE PNG SWEEP ABOVE ON PURPOSE. That -delete strips dev-source
+# PNGs out of textures/; these are the real payload and must survive it.
+mkdir -p "$STAGE/SKSE/Plugins/MenuStudio"
+cp -r "$ROOT/dist/SKSE/Plugins/MenuStudio/icons" "$STAGE/SKSE/Plugins/MenuStudio/icons"
 cp "$ROOT/LICENSE" "$ROOT/README.md" "$ROOT/CHANGELOG.md" "$STAGE/"
 
 (cd "$STAGE" && powershell -NoProfile -Command \

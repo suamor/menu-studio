@@ -32,7 +32,7 @@ namespace MTB::CbpcDrive {
     void Init() {
         const HMODULE mod = ::GetModuleHandleW(L"cbp.dll");
         if (!mod) {
-            spdlog::info("CBPC: cbp.dll not loaded - body-physics drive disabled.");
+            spdlog::info("CBPC: cbp.dll not loaded, body-physics drive disabled.");
             return;
         }
         const auto base = reinterpret_cast<std::uintptr_t>(mod);
@@ -51,11 +51,11 @@ namespace MTB::CbpcDrive {
         if (!build) {
             spdlog::error(
                 "CBPC: cbp.dll is an unknown build (stamp 0x{:08X} size 0x{:X}). Body-physics "
-                "drive disabled - everything else works.", stamp, size);
+                "drive disabled, everything else works.", stamp, size);
             return;
         }
         g_flag = reinterpret_cast<std::uint8_t*>(base + build->raceSexMenuOpenRva);
-        spdlog::info("CBPC: recognized {} - body physics will simulate while the bubble is armed.",
+        spdlog::info("CBPC: recognized {}: body physics will simulate while the bubble is armed.",
                      build->name);
     }
 

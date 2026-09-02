@@ -15,6 +15,10 @@ namespace MTB::BackdropPacks {
     std::span<const BackgroundPreset> Backgrounds();  // built-ins first, then packs
     std::span<const StagePreset>      Stages();        // built-ins first, then packs
 
+    // How many entries at the front of Backgrounds() are the shipped
+    // built-ins. The card picker splits its accordions on this line.
+    std::size_t BuiltinBackgroundCount();
+
     // Author of the pack that contributed a preset name ("" for built-ins /
     // unknown). Used for the menu tooltip. The returned view is invalidated by
     // the next Scan(), same as the spans above.

@@ -2,7 +2,10 @@
 
 #include "OwnView.h"
 
+#include "MountedSubjectPolicy.h"
+#include "RotationOwnershipPolicy.h"
 #include "Settings.h"
+#include "WeaponStance.h"
 
 #include <SimpleIni.h>
 #include <Windows.h>
@@ -71,7 +74,7 @@ namespace {
             ini.GetDoubleValue("Camera", "fFOV", g_cov.spiiFov));
         if (wasBarter != g_cov.spiiBarter) {
             spdlog::info("own view: SPII barter coverage changed to {} (its panel "
-                         "writes the INI live) - barter framing follows it now.",
+                         "writes the INI live), barter framing follows it now.",
                          g_cov.spiiBarter);
         }
     }
@@ -119,12 +122,12 @@ namespace {
                 g_cov.spiiBarter = ini.GetBoolValue("General", "bBarterMenu", false);
                 RefreshSpiiIni();  // also pick up its [Camera] values
             } else {
-                spdlog::warn("own view: could not read '{}' - assuming SPII "
+                spdlog::warn("own view: could not read '{}', assuming SPII "
                              "barter coverage OFF (defer will not happen).",
                              iniPath.string());
             }
         }
-        spdlog::info("own view: view-mod scan - SPIM={} SPII={} (SPII barter={}).",
+        spdlog::info("own view: view-mod scan: SPIM={} SPII={} (SPII barter={}).",
                      g_cov.spim, g_cov.spii, g_cov.spiiBarter);
     }
 
@@ -230,6 +233,15 @@ namespace {
         bool         headtrackingWasEnabled = false;
         bool         toggleAnimCam = false;
         bool         freeRotationEnabled = false;
+        // ⚠⚠ THE STANCE THE TWO FLAGS ABOVE WERE READ IN. The engine derives
+        // both from whether the weapon is out, so they are only ours to hand
+        // back while the player is still standing the way they were when we
+        // looked. The weapon preview draws on open and sheathes on close, and
+        // the gate sheathes outright when combat starts, so a menu session is
+        // exactly where the stance moves underneath the capture. Decision in
+        // RotationOwnershipPolicy.h::ChooseStanceFlags.
+        bool         weaponDrawn = false;
+        bool         stanceKnown = false;
         float        angleX = 0.0f;
         float        angleZ = 0.0f;
         float        targetZoomOffset = 0.0f;
@@ -244,6 +256,12 @@ namespace {
         // pointer is swapped out, the blur-RADIUS interpolator's held
         // float zeroed in place.
         bool                               blurParked = false;
+        // ⚠ ONE LINE PER OWED DEBT, NOT ONE PER FRAME. The retry that collects
+        // a failed restore runs from Bubble::Disarm, which ticks every frame
+        // while no menu is open - so an unbounded log here would be a wall of
+        // identical errors for as long as the singleton stayed null, in a build
+        // that flushes every line to disk synchronously.
+        bool                               owedLogged = false;
         RE::NiPointer<RE::NiFloatInterpolator> radialBlurStrength;
         float                              blurRadiusValue = 0.0f;
         std::array<SettingSlot, 9> ini{ { { "fOverShoulderCombatPosX:Camera" },
@@ -284,6 +302,12 @@ namespace {
 }
 
 namespace MTB::OwnView {
+
+    namespace MSP = MountedSubjectPolicy;
+    bool ExternalProviderCovers(const std::string& a_menuName) {
+        return MenuCovered(a_menuName);
+    }
+
     bool ShouldOwn(const std::string& a_menuName, bool a_firstPersonArm) {
         const auto& s = Settings::GetSingleton();
         // r41 (user: "we should use SPII and make it work in the barter
@@ -306,7 +330,8 @@ namespace MTB::OwnView {
         return s.ownViewUnmanaged;
     }
 
-    void ApplyFraming(bool a_forcedThirdFromFirst, bool a_mounted) {
+    void ApplyFraming(bool a_forcedThirdFromFirst, bool a_mounted,
+                      std::optional<PriorCamera> a_prior) {
         if (g_state.active) {
             return;  // already framed (menu switch keeps the arm alive)
         }
@@ -335,14 +360,25 @@ namespace MTB::OwnView {
         g_state.posOffsetExpected = third->posOffsetExpected;
         g_state.toggleAnimCam = third->toggleAnimCam;
         g_state.freeRotationEnabled = third->freeRotationEnabled;
-        g_state.worldFOV = camera->worldFOV;
+        // Read in the same breath as the flags it qualifies - a stance sampled
+        // any later is already a different question.
+        {
+            const auto stance = MTB::WeaponStance::Read(player);
+            g_state.stanceKnown = stance.known;
+            g_state.weaponDrawn = stance.drawn;
+        }
+        // ⚠ THE TWEEN MENU'S FIELD OF VIEW IS NOT THE PLAYER'S. Through Tab the
+        // arm finds worldFOV already at the tween's value (90 on two rigs against
+        // a gameplay 80), and the close wrote it back as though it were theirs.
+        // The bubble hands in the reading its park took before the tween.
+        g_state.worldFOV = a_prior ? a_prior->worldFOV : camera->worldFOV;
         player->GetGraphVariableBool("IsNPC", g_state.headtrackingWasEnabled);
         for (auto& slot : g_state.ini) {
             slot.setting = iniCol->GetSetting(slot.name);
             if (slot.setting) {
                 slot.original = slot.setting->data.f;
             } else {
-                spdlog::warn("own view: INI Setting '{}' not found - skipped.", slot.name);
+                spdlog::warn("own view: INI Setting '{}' not found, skipped.", slot.name);
             }
         }
 
@@ -361,7 +397,13 @@ namespace MTB::OwnView {
             // while physically mounted just changes the camera - the
             // player stays seated and the horse keeps rendering, so the
             // over-shoulder framing shows both.
-            if (camera->currentState) {
+            // ⚠⚠ NEVER kTween. Field 2026-09-02: the arm found the tween menu's
+            // state, remembered it here, and the close did SetState(kTween)
+            // into a state whose menu was already gone. STILL WRONG at +8.01s.
+            // The bubble now says what to return to (ChooseReturnState).
+            if (a_prior) {
+                g_state.savedStateId = static_cast<RE::CameraState>(a_prior->stateId);
+            } else if (camera->currentState) {
                 g_state.savedStateId = camera->currentState->id;
             }
             camera->SetState(third);
@@ -435,8 +477,31 @@ namespace MTB::OwnView {
         third->pitchZoomOffset = 0.1f;     // distance independent of camera pitch
         third->posOffsetExpected = third->posOffsetActual =
             RE::NiPoint3{ sx, sy, sz };
-        player->data.angle.x = (spiiLook ? 0.1f : 0.2f) + f.pitch +
-                               (a_mounted ? s.ownViewMountPitch : 0.0f);
+        // ⚠ THE MOUNTED AIM IS DERIVED, NOT DIALLED, AND THAT IS THE FIX FOR
+        // THE RIDER SITTING LOW. The raise above is a camera POSITION offset
+        // with the view left level, so it lifts the lens and drops the subject
+        // out of the bottom of the frame - field-confirmed twice by screenshot,
+        // cropped at the shoulders with empty sky over her head. Dialling the
+        // raise up is on the do-not-retry list because it makes exactly that
+        // worse. The angle follows the lens instead: MountedSubjectPolicy
+        // carries the measurement and the arithmetic.
+        //
+        // fOwnViewMountPitch stays a user offset ON TOP, so anyone who wants a
+        // different mounted look still has the knob, and now it starts from a
+        // shot that is already on the rider.
+        const float basePitch = spiiLook ? 0.1f : 0.2f;
+        const float mountAim =
+            a_mounted ? MSP::AimPitch(sz, boom, basePitch) + s.ownViewMountPitch
+                      : 0.0f;
+        player->data.angle.x = basePitch + f.pitch + mountAim;
+        if (a_mounted) {
+            spdlog::info("own view: mounted aim: lens {:.1f} over the rider's "
+                         "ref at boom {:.1f}, so the shot pitches an extra "
+                         "{:.3f} rad onto her (base {:.2f}, INI asks {:.3f}); "
+                         "total {:.3f}.",
+                         sz, boom, MSP::AimPitch(sz, boom, basePitch), basePitch,
+                         s.ownViewMountPitch, player->data.angle.x);
+        }
         camera->worldFOV = spiiLook ? g_cov.spiiFov : 90.0f;
         // Headtracking off while framed (SPIM's own move); the B-3 head pin
         // keeps the head sane when another mod re-drives tracking through
@@ -473,13 +538,40 @@ namespace MTB::OwnView {
         if (!g_state.active) {
             return;
         }
-        g_state.active = false;
         auto* camera = RE::PlayerCamera::GetSingleton();
         auto* player = RE::PlayerCharacter::GetSingleton();
         auto* third = ThirdStateObject();
         if (!camera || !player || !third) {
+            // ⚠ OWNERSHIP STAYS OURS, AND THE ORDER IS THE WHOLE POINT.
+            // `g_state.active = false` used to sit ABOVE this guard, so a
+            // momentarily null singleton dropped the debt in silence: the
+            // framing was still live on the engine, and the next ApplyFraming
+            // then passed its own `active` guard and captured toggleAnimCam
+            // TRUE, FOV 90 and the mangled over-shoulder Settings AS ITS
+            // ORIGINALS. From that point every teardown restores the framing,
+            // faithfully, forever. That is a camera that cannot look up or down
+            // and never recovers, which is the field report exactly.
+            //
+            // Leaving the flag set makes the debt survivable instead: the
+            // collector at the tail of Bubble::Disarm retries it on a later
+            // frame, and Disarm() runs every frame while no counted menu is
+            // open, so the retry is free.
+            if (!g_state.owedLogged) {
+                g_state.owedLogged = true;
+                spdlog::error("own view: restore could not run (camera {} player {} "
+                              "third {}): the framing is still OWED and will be "
+                              "retried every teardown frame until it can. This line "
+                              "appears once per owed debt, not once per frame.",
+                              camera != nullptr, player != nullptr, third != nullptr);
+            }
             return;
         }
+        if (g_state.owedLogged) {
+            spdlog::info("own view: the owed restore was collected: the framing is "
+                         "handed back now.");
+        }
+        g_state.active = false;
+        g_state.owedLogged = false;
         // SPIM ResetCamera order: first person handed back FIRST (when we
         // forced the switch), then every original written back, one camera
         // update, and the mouse-wheel zoom speed only AFTER the update (the
@@ -499,8 +591,46 @@ namespace MTB::OwnView {
         // into the player heading - put the entry heading back (SPIM does
         // the same, in this same spot of its ResetCamera order).
         player->data.angle.z = g_state.angleZ;
-        third->toggleAnimCam = g_state.toggleAnimCam;
-        third->freeRotationEnabled = g_state.freeRotationEnabled;
+        // ⚠⚠ THE TWO FLAGS ARE RE-DERIVED WHEN THE STANCE MOVED. Every other
+        // line in this restore hands back a value the player owned; these two
+        // are the engine's own answer to "is the weapon out", and the framing
+        // above overwrote them (toggleAnimCam = true, freeRotationEnabled =
+        // true) to get the shot. Handing the capture back is right only while
+        // that question still has the same answer, and a menu is where it stops
+        // having one: the weapon preview draws on the way in and sheathes on
+        // the way out, and combat starting mid-menu sheathes there and then.
+        // Restoring the stale pair is the camera that yaws but will not pitch.
+        {
+            namespace P = MTB::RotationOwnershipPolicy;
+            const auto stanceNow = MTB::WeaponStance::Read(player);
+            const auto plan = P::ChooseStanceFlags({
+                .haveCapture = true,
+                .stanceKnownAtCapture = g_state.stanceKnown,
+                .drawnAtCapture = g_state.weaponDrawn,
+                .stanceKnownNow = stanceNow.known,
+                .drawnNow = stanceNow.drawn,
+            });
+            // ⚠⚠ THE ANIM CAM IS HANDED OFF, NOT HANDED BACK. Its capture is
+            // never consulted, here or in the park, because no reading of it
+            // beats "let the player look up and down" and a stale TRUE is the
+            // dead pitch itself. Show Player In Menus hardcodes the same false
+            // in its own ResetCamera. Reasoning at kAnimCamHandBack.
+            third->toggleAnimCam = P::kAnimCamHandBack;
+            if (plan == P::StanceFlags::kEngineDerived) {
+                spdlog::info(
+                    "own view: STANCE CHANGED across the menu ({} at the framing, "
+                    "{} now), so free rotation is re-derived instead of handed "
+                    "back: freeRotEnabled {} (the capture held {}).",
+                    g_state.weaponDrawn ? "drawn" : "sheathed",
+                    stanceNow.drawn ? "drawn" : "sheathed",
+                    P::FreeRotationForStance(stanceNow.drawn),
+                    g_state.freeRotationEnabled);
+                third->freeRotationEnabled =
+                    P::FreeRotationForStance(stanceNow.drawn);
+            } else {
+                third->freeRotationEnabled = g_state.freeRotationEnabled;
+            }
+        }
         third->targetZoomOffset = g_state.targetZoomOffset;
         third->pitchZoomOffset = g_state.pitchZoomOffset;
         third->freeRotation = g_state.freeRotation;
@@ -521,8 +651,15 @@ namespace MTB::OwnView {
         // current -> target over half a second after the restore - snap them.
         third->currentZoomOffset = third->targetZoomOffset;
         third->currentYaw = third->targetYaw;
+        // ⚠ NAMES THE STATE, NOT "FIRST PERSON". This label said first person
+        // for every forced-third arm, and on 2026-09-02 it said so in the very
+        // session that handed kThirdPerson back. A label that lies in the one
+        // log that matters is worse than a number.
         spdlog::info("own view: framing restored{}.",
-                     g_state.forcedThird ? " (first person handed back)" : "");
+                     g_state.forcedThird
+                         ? fmt::format(" (camera state {} handed back)",
+                                       static_cast<int>(g_state.savedStateId))
+                         : std::string{});
     }
 
     void DropOnLoad() {
@@ -530,6 +667,9 @@ namespace MTB::OwnView {
             return;
         }
         g_state.active = false;
+        // The debt dies with the save it belonged to, so the retry must stop
+        // asking for it and the next owed one must be able to speak again.
+        g_state.owedLogged = false;
         // Only the surfaces that survive a load: the INI Settings and the
         // camera/state singletons. Actor data, graph variables and the
         // camera state stack belong to the incoming save.
@@ -539,7 +679,10 @@ namespace MTB::OwnView {
             }
         }
         if (auto* third = ThirdStateObject()) {
-            third->toggleAnimCam = g_state.toggleAnimCam;
+            // Same rule as the ordinary teardown: the anim cam goes off rather
+            // than back, so a framing caught by a load cannot leave a camera
+            // that will not pitch on the other side of it.
+            third->toggleAnimCam = MTB::RotationOwnershipPolicy::kAnimCamHandBack;
             third->freeRotationEnabled = g_state.freeRotationEnabled;
             third->targetZoomOffset = g_state.targetZoomOffset;
             third->pitchZoomOffset = g_state.pitchZoomOffset;

@@ -2,6 +2,7 @@
 
 #include "ForcePause.h"
 
+#include "PauseLingerPolicy.h"
 #include "Settings.h"
 #include "ShadowPause.h"
 
@@ -92,20 +93,31 @@ namespace {
     // the load-bearing part; the PAUSE is. So under Skyrim Souls we no longer
     // touch menu flags or numPausesGame at all - we hold RE::Main::freezeTime
     // (the `tfc 1` mechanism: world frozen, rendering/input/UI alive) for as
-    // long as a covered menu is open, plus a short linger to bridge the
-    // close->open gap of a menu switch. Souls has nothing to strip, there is no
-    // counter to drift, and the r6 bug class cannot exist here.
+    // long as a covered menu is open. Menu Studio-owned views keep a short
+    // linger to bridge the close->open gap of a menu switch; external camera
+    // providers release immediately so SmoothCam can publish gameplay framing.
+    // Souls has nothing to strip, there is no counter to drift, and the r6 bug
+    // class cannot exist here.
     //
     // The hold is guarded: taken only if freezeTime is currently false (a `tfc
     // 1` user or another freezer keeps theirs), released only if we hold it,
-    // reconciled per frame against the UI map (a menu that dies without a close
-    // event cannot strand the freeze), and dropped immediately on the live
-    // panel toggle, ReleaseAll and Reset.
+    // and dropped immediately on the live panel toggle, ReleaseAll and Reset.
+    //
+    // ⚠ THERE IS NO PER-FRAME RECONCILE AGAINST THE UI MAP, and this comment
+    // claimed there was one for several versions. It said "a menu that dies
+    // without a close event cannot strand the freeze". It can, and it did: the
+    // covered set below is fed ONLY by the open/close event pair, so a missed
+    // close leaves the freeze re-asserted every frame with nothing able to
+    // release it. That is a frozen world and no UI.
+    //
+    // A reconcile does NOT belong here: a menu can lag the UI map right after
+    // its own open event (the r14 race), so a map-keyed purge would evict a live
+    // menu. The reconcile lives in Bubble's orphan self-heal instead, which
+    // waits 60 frames for bounded evidence before it calls ReleaseAll.
     std::unordered_set<std::string> g_covered;   // covered menus currently open (Souls mode)
     bool g_freezeHeld  = false;                  // WE set Main::freezeTime (never clear another's)
-    int  g_lingerLeft  = 0;                      // frames of freeze kept past the last close
-    constexpr int kFreezeLingerFrames = 20;      // ~115ms @175fps, ~333ms @60fps - covers the
-                                                 // field-measured 32ms switch gap with margin
+    bool g_lingerArmed = false;
+    MTB::PauseLingerPolicy::Clock::time_point g_lingerUntil{};
 
     bool SoulsMode() {
         return MTB::Settings::GetSingleton().soulsLoaded;
@@ -136,8 +148,15 @@ namespace {
         return g_freezeHeld || MTB::ShadowPause::IsUp();
     }
 
+    void ArmLinger() {
+        g_lingerArmed = true;
+        g_lingerUntil =
+            MTB::PauseLingerPolicy::Clock::now() +
+            MTB::PauseLingerPolicy::kMenuSwitchLinger;
+    }
+
     void HoldFreeze(const char* a_why) {
-        g_lingerLeft = kFreezeLingerFrames;
+        ArmLinger();
         if (UseShadowMenu()) {
             MTB::ShadowPause::Show();  // idempotent; the ENGINE moves numPausesGame
             return;
@@ -151,13 +170,14 @@ namespace {
         }
         main->freezeTime = true;
         g_freezeHeld = true;
-        spdlog::info("ForcePause: holding Main::freezeTime ({}) - Souls-live menu, "
+        spdlog::info("ForcePause: holding Main::freezeTime ({}): Souls-live menu, "
                      "world frozen without touching menu flags.",
                      a_why);
     }
 
     void ReleaseFreeze(const char* a_why) {
-        g_lingerLeft = 0;
+        g_lingerArmed = false;
+        g_lingerUntil = {};
         MTB::ShadowPause::Hide();  // unconditional: never strand it if the setting flips
         if (!g_freezeHeld) {
             return;
@@ -199,10 +219,10 @@ namespace {
         if (!g_loggedUnderflow) {
             g_loggedUnderflow = true;
             spdlog::warn(
-                "ForcePause: numPausesGame was {} ({} as signed) - it UNDERFLOWED, so the "
+                "ForcePause: numPausesGame was {} ({} as signed), it UNDERFLOWED, so the "
                 "game read as permanently paused and the world could not resume. Snapped to "
                 "the engine invariant ({} open pausing menu(s)). If this repeats, something "
-                "is decrementing the counter every frame - see the r6 note in ForcePause.cpp.",
+                "is decrementing the counter every frame, see the r6 note in ForcePause.cpp.",
                 a_ui->numPausesGame, static_cast<std::int32_t>(a_ui->numPausesGame), expected);
         }
         a_ui->numPausesGame = expected;
@@ -286,7 +306,7 @@ namespace MTB::ForcePause {
                 g_pending.erase(a_menuName);
                 g_retakes.erase(a_menuName);  // fresh menu session, fresh retake budget
                 spdlog::info(
-                    "ForcePause: {} opened UNPAUSED (Skyrim Souls?) - re-paused (flag set, "
+                    "ForcePause: {} opened UNPAUSED (Skyrim Souls?), re-paused (flag set, "
                     "counter now {}). Settled against the engine after close.",
                     a_menuName, ui->numPausesGame);
                 break;
@@ -297,14 +317,14 @@ namespace MTB::ForcePause {
                 // The open event beat the UI map. Hand it to the per-frame
                 // settle rather than dropping it on the floor.
                 g_pending[a_menuName] = kPendingFrames;
-                spdlog::debug("ForcePause: {} not in the UI map at its own open event - "
+                spdlog::debug("ForcePause: {} not in the UI map at its own open event, "
                               "queued for retry.",
                               a_menuName);
                 break;
         }
     }
 
-    void OnMenuClosed(const std::string& a_menuName) {
+    void OnMenuClosed(const std::string& a_menuName, bool a_externalCameraHandoff) {
         // A menu that closed before we ever managed to take it has nothing left
         // to retry, so stop looking for it. Everything else is intentionally
         // nothing: the g_forced record stays until the per-frame settle
@@ -313,10 +333,84 @@ namespace MTB::ForcePause {
         // Settling at the close EVENT would mean guessing the pump's ordering,
         // and trusting the close edge is exactly what froze AE 1.6 + Souls.
         g_pending.erase(a_menuName);
-        // r17: the freeze itself is NOT released here - the per-frame settle
-        // owns that, through the linger, so a menu SWITCH (close then open a
-        // few frames apart) never lets the world run in the gap.
+        // r17/r62: Menu Studio-owned framing keeps the per-frame linger so a
+        // switch never lets the world run in the gap. External framing must
+        // release here or SmoothCam stays update-blocked behind a closed UI.
         g_covered.erase(a_menuName);
+        using MTB::PauseLingerPolicy::CloseDecision;
+        const auto closeDecision = MTB::PauseLingerPolicy::ChooseClose({
+            .lastCoveredMenuClosed = g_covered.empty(),
+            .holdActive = HoldActive(),
+            .externalCameraHandoff = a_externalCameraHandoff,
+        });
+        if (closeDecision == CloseDecision::kReleaseExternalCamera) {
+            // SPII/SPIM has its own close handoff. Holding freezeTime after the
+            // UI disappears prevents SmoothCam from publishing its gameplay
+            // FOV/position, so the provider's fallback camera becomes visible.
+            // Release inside the close pump: no render can occur between this
+            // and the external sink completing its restore.
+            ReleaseFreeze("external camera handoff");
+        } else if (closeDecision == CloseDecision::kArmSwitchLinger) {
+            // Start the bridge at the actual close edge. The old 20-frame
+            // countdown lasted a full second at 20 FPS; wall-clock time keeps
+            // the switch margin constant on every setup.
+            ArmLinger();
+        }
+    }
+
+    bool Holding() {
+        // Both mechanisms, because a caller asking this wants "is a pause ours
+        // right now", not "which door did it come through". HoldActive covers
+        // the Souls-mode freeze and the shadow menu; g_forced covers the flag
+        // mode. Any future mechanism belongs here as well as in
+        // HoldFreeze/ReleaseFreeze - see the r19b note on what a hold whose
+        // release keys off the wrong state variable costs.
+        return HoldActive() || !g_forced.empty();
+    }
+
+    void ReleaseFor(const std::string& a_menuName) {
+        // r17 Souls mode holds ONE freeze covering every covered menu, so the
+        // release is "drop this menu, and stand down only if it was the last".
+        // No linger: nothing is switching, the menu the player is looking at is
+        // still there, and a bridge would just delay handing it back.
+        if (SoulsMode()) {
+            if (g_covered.erase(a_menuName) == 0) {
+                return;  // never covered this one - nothing owed
+            }
+            if (!g_covered.empty()) {
+                spdlog::info("ForcePause: studio session left {} but {} other covered "
+                             "menu(s) are still open, the freeze stays.",
+                             a_menuName, g_covered.size());
+                return;
+            }
+            ReleaseFreeze("studio session left with the menu still open");
+            return;
+        }
+        // Flag mode. Same balanced pair ReleaseAll uses on one name: clear the
+        // flag ourselves so the engine's later close bookkeeping will NOT also
+        // decrement, then drop our own increment.
+        g_pending.erase(a_menuName);
+        if (g_forced.erase(a_menuName) == 0) {
+            return;  // the menu paused itself (vanilla) - we hold nothing
+        }
+        g_retakes.erase(a_menuName);
+        auto* ui = RE::UI::GetSingleton();
+        if (!ui) {
+            spdlog::warn("ForcePause: studio session left {} with no UI singleton, the "
+                         "held pause could not be given back here. The per-frame settle "
+                         "reclaims it when the menu closes.",
+                         a_menuName);
+            return;
+        }
+        if (auto menu = ui->GetMenu(a_menuName)) {
+            menu->menuFlags.reset(RE::UI_MENU_FLAGS::kPausesGame);
+        }
+        if (ui->numPausesGame > 0) {
+            ui->numPausesGame--;
+        }
+        spdlog::info("ForcePause: {} handed back while still open (studio session left), "
+                     "flag cleared, counter now {}.",
+                     a_menuName, ui->numPausesGame);
     }
 
     void ReleaseAll() {
@@ -387,17 +481,24 @@ namespace MTB::ForcePause {
         // down without close events). Deliberately NOT reconciled against
         // ui->GetMenu here: a just-opened menu can lag the UI map (the r14
         // race), and a map-keyed purge would evict it with nothing left to
-        // re-insert it. Hold while any covered menu is open, linger a few
-        // frames past the last close (the field-measured 32ms switch gap),
-        // then release.
+        // re-insert it. Hold while any covered menu is open, then bridge the
+        // field-measured switch gap in wall-clock time. A frame countdown made
+        // the close delay inversely proportional to FPS (20 frames = 1 second
+        // at 20 FPS).
         if (SoulsMode()) {
+            using MTB::PauseLingerPolicy::Decision;
+            const auto decision = MTB::PauseLingerPolicy::Choose({
+                .coveredMenuOpen = !g_covered.empty(),
+                .holdActive = HoldActive(),
+                .lingerArmed = g_lingerArmed,
+                .now = MTB::PauseLingerPolicy::Clock::now(),
+                .lingerUntil = g_lingerUntil,
+            });
             if (!g_covered.empty()) {
                 HoldFreeze("settle");  // also re-arms the linger
-            } else if (g_lingerLeft > 0) {
-                if (--g_lingerLeft == 0) {
-                    ReleaseFreeze("last covered menu closed, linger elapsed");
-                }
-            } else if (HoldActive()) {
+            } else if (decision == Decision::kReleaseElapsedLinger) {
+                ReleaseFreeze("last covered menu closed, linger elapsed");
+            } else if (decision == Decision::kReleaseOrphanedHold) {
                 // SELF-HEAL, and the reason this is a separate branch rather
                 // than a tighter condition above: no covered menu is open and
                 // the linger is spent, yet we are still holding a pause. That
@@ -418,7 +519,7 @@ namespace MTB::ForcePause {
             switch (TryTake(ui, it->first)) {
                 case TakeResult::kTaken:
                     spdlog::info(
-                        "ForcePause: {} re-paused ON RETRY (flag set, counter now {}) - its "
+                        "ForcePause: {} re-paused ON RETRY (flag set, counter now {}), its "
                         "open event fired before the menu was in the UI map.",
                         it->first, ui->numPausesGame);
                     it = g_pending.erase(it);
@@ -430,7 +531,7 @@ namespace MTB::ForcePause {
                     if (--it->second <= 0) {
                         spdlog::warn(
                             "ForcePause: gave up waiting for {} to appear in the UI map after "
-                            "{} frames - it stays unpaused, so the studio will be dormant for "
+                            "{} frames, it stays unpaused, so the studio will be dormant for "
                             "it. If this shows up in a field log, the menu name or the open "
                             "event is wrong, not the timing.",
                             it->first, kPendingFrames);
@@ -480,12 +581,12 @@ namespace MTB::ForcePause {
                         ui->numPausesGame++;
                         spdlog::info(
                             "ForcePause: {} had kPausesGame stripped while open (Skyrim "
-                            "Souls answered the take) - RE-TOOK it (round {}/{}, counter "
+                            "Souls answered the take), RE-TOOK it (round {}/{}, counter "
                             "now {}).",
                             *it, rounds, kMaxRetakes, ui->numPausesGame);
                     } else {
                         spdlog::warn(
-                            "ForcePause: {} was re-stripped {}x - conceding the fight "
+                            "ForcePause: {} was re-stripped {}x, conceding the fight "
                             "(bounded); the bubble goes dormant for this menu session.",
                             *it, kMaxRetakes);
                         g_retakes.erase(*it);
@@ -506,7 +607,7 @@ namespace MTB::ForcePause {
                 ui->numPausesGame--;
                 spdlog::info(
                     "ForcePause: {} closed but the engine kept our pause (counter "
-                    "{} > {} open pausing menus) - reclaimed, world resumes. (The "
+                    "{} > {} open pausing menus), reclaimed, world resumes. (The "
                     "1.6 Souls build misses the flag-keyed close decrement.)",
                     *it, ui->numPausesGame + 1, expected);
             } else {

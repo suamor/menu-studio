@@ -38,6 +38,21 @@ namespace {
     bool HasSection(const CSimpleIniA& a_ini, const char* a_sec) {
         return a_ini.GetSectionSize(a_sec) >= 0;  // -1 when the section is absent
     }
+
+    bool EndsWithCi(std::string_view a_s, std::string_view a_suffix) {
+        if (a_s.size() < a_suffix.size()) {
+            return false;
+        }
+        for (std::size_t i = 0; i < a_suffix.size(); ++i) {
+            const char a = a_s[a_s.size() - a_suffix.size() + i], b = a_suffix[i];
+            const char la = (a >= 'A' && a <= 'Z') ? static_cast<char>(a + 32) : a;
+            const char lb = (b >= 'A' && b <= 'Z') ? static_cast<char>(b + 32) : b;
+            if (la != lb) {
+                return false;
+            }
+        }
+        return true;
+    }
 }
 
 namespace MTB {
@@ -60,27 +75,71 @@ namespace MTB {
             return pack;
         }
 
-        if (HasSection(ini, "Background")) {
-            const std::string image = GetS(ini, "Background", "image");
-            const std::string dome = GetS(ini, "Background", "dome");
+        pack.group = GetS(ini, "Pack", "group");
+
+        // [Background], then [Background1], [Background2], ... - the same
+        // numbered-section walk the pieces use, stopping at the first absent
+        // section. A single-background pack is the plain [Background] and
+        // nothing changed for it.
+        const auto parseBackground = [&](const char* a_sec, int a_index) {
+            const std::string image = GetS(ini, a_sec, "image");
+            const std::string dome = GetS(ini, a_sec, "dome");
             if (image.empty() && dome.empty()) {
-                pack.warnings.emplace_back("[Background] has neither image nor dome; ignored");
-            } else {
-                pack.hasBackground = true;
-                if (!image.empty() && !dome.empty()) {
-                    pack.warnings.emplace_back("[Background] has both image and dome; using image");
-                }
-                if (!image.empty()) {
-                    pack.bgImage = image;
-                    pack.bgFaceCamera = GetB(ini, "Background", "faceCamera", true);
-                } else {
-                    pack.bgDome = dome;
-                    pack.bgFaceCamera = GetB(ini, "Background", "faceCamera", false);
-                }
-                pack.bgRadius = GetF(ini, "Background", "radius", 2200.0f);
-                pack.bgZ = GetF(ini, "Background", "z", 0.0f);
-                pack.bgYaw = GetF(ini, "Background", "yaw", 0.0f);
+                pack.warnings.push_back(std::string{ "[" } + a_sec +
+                                        "] has neither image nor dome; ignored");
+                return;
             }
+            ParsedBackground bg;
+            bg.name = GetS(ini, a_sec, "name");
+            if (bg.name.empty()) {
+                bg.name = a_index == 0 ? pack.name
+                                       : pack.name + " " + std::to_string(a_index);
+            }
+            if (!image.empty() && !dome.empty()) {
+                pack.warnings.push_back(std::string{ "[" } + a_sec +
+                                        "] has both image and dome; using image");
+            }
+            if (!image.empty()) {
+                bg.image = image;
+                bg.faceCamera = GetB(ini, a_sec, "faceCamera", true);
+                // A wrong-format path fails INVISIBLY at load - the engine
+                // substitutes a live placeholder texture, not a null - so
+                // the parse is the one place the mistake can be named.
+                if (!EndsWithCi(image, ".dds")) {
+                    pack.warnings.push_back(std::string{ "[" } + a_sec +
+                                            "] image does not end in .dds; the "
+                                            "engine will show a flat placeholder");
+                }
+            } else {
+                bg.dome = dome;
+                bg.faceCamera = GetB(ini, a_sec, "faceCamera", false);
+            }
+            bg.thumb = GetS(ini, a_sec, "thumb");
+            bg.radius = BackdropPolicy::ClampBackgroundRadius(
+                GetF(ini, a_sec, "radius", BackdropPolicy::kBackgroundRadiusDefault));
+            bg.z = GetF(ini, a_sec, "z", 0.0f);
+            bg.yaw = GetF(ini, a_sec, "yaw", 0.0f);
+            pack.backgrounds.push_back(std::move(bg));
+        };
+        if (HasSection(ini, "Background")) {
+            parseBackground("Background", 0);
+        }
+        for (int i = 1;; ++i) {
+            const std::string sec = "Background" + std::to_string(i);
+            if (!HasSection(ini, sec.c_str())) {
+                break;
+            }
+            parseBackground(sec.c_str(), i);
+        }
+        if (!pack.backgrounds.empty()) {
+            pack.hasBackground = true;
+            const auto& first = pack.backgrounds.front();
+            pack.bgImage = first.image;
+            pack.bgDome = first.dome;
+            pack.bgRadius = first.radius;
+            pack.bgZ = first.z;
+            pack.bgFaceCamera = first.faceCamera;
+            pack.bgYaw = first.yaw;
         }
 
         if (HasSection(ini, "Stage")) {

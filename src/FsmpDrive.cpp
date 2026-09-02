@@ -95,6 +95,41 @@ namespace {
         { 0x6A4A9ECC, 0x40F000, 0x3D9180, 0x93FE0, 0,
           0x228, 0, 0x354, 0x358, 0x360, 0x368, 0x380, 0x381, 0x3E8, 0x3E9,
           "Faster HDT-SMP 4.0.1 (AE, AVX-512)" },
+        // AE next-gen (4.1.1), ALL FOUR CPU builds. Member layout is IDENTICAL
+        // to 4.0.1 above, same source line, so only the three RVAs moved per
+        // variant. Each read from ITS OWN shipped hdtsmp64.pdb on 2026-08-29 by
+        // the recipe in [[fsmp-build-profile-extraction]], and the whole
+        // extraction was CALIBRATED first against the 4.0.1 AVX-512 row above,
+        // which it reproduced exactly (world 0x3D9180, upd 0x93FE0, and all ten
+        // members).
+        //
+        // ⚠ THE FOUR BUILDS SHIP INSIDE ONE DOWNLOAD, which is why the mod
+        // page lists a single 4.1.1 file: the archive holds raw-vs2022-windows,
+        // -avx, -avx2 and -avx512, and the installer picks one. Reading only
+        // the variant installed on the dev rig would have left three quarters
+        // of users with no menu physics.
+        //
+        // ⚠ THE LABELS ARE THE ARCHIVE'S OWN FOLDER NAMES, not a guess from the
+        // disassembly. An instruction census confirms the ends of the range
+        // (SSE2 uses no vector registers, AVX-512 uses zmm) but CANNOT separate
+        // AVX from AVX2 here: both show 227 ymm uses and neither shows an
+        // AVX2-only or FMA form. So the author's own folder names decide.
+        //
+        // All four sanity-checked against their PE: doUpdate2ndStep in .text
+        // and executable, g_World in .data, writable and 8-byte aligned, and
+        // the object's last member (+0x3E9) inside that section.
+        { 0x6A8F44A7, 0x41A000, 0x3E33D0, 0x95CD0, 0,
+          0x228, 0, 0x354, 0x358, 0x360, 0x368, 0x380, 0x381, 0x3E8, 0x3E9,
+          "Faster HDT-SMP 4.1.1 (AE, SSE2)" },
+        { 0x6A8F44A9, 0x41B000, 0x3E43D0, 0x963B0, 0,
+          0x228, 0, 0x354, 0x358, 0x360, 0x368, 0x380, 0x381, 0x3E8, 0x3E9,
+          "Faster HDT-SMP 4.1.1 (AE, AVX)" },
+        { 0x6A8F44CA, 0x419000, 0x3E23D0, 0x95A40, 0,
+          0x228, 0, 0x354, 0x358, 0x360, 0x368, 0x380, 0x381, 0x3E8, 0x3E9,
+          "Faster HDT-SMP 4.1.1 (AE, AVX2)" },
+        { 0x6A8F449E, 0x417000, 0x3E03D0, 0x95430, 0,
+          0x228, 0, 0x354, 0x358, 0x360, 0x368, 0x380, 0x381, 0x3E8, 0x3E9,
+          "Faster HDT-SMP 4.1.1 (AE, AVX-512)" },
     };
 
     using DoUpdate2ndStepFn = void(__fastcall*)(void* a_world, float a_interval,
@@ -126,7 +161,7 @@ namespace MTB::FsmpDrive {
     void Init() {
         const HMODULE mod = ::GetModuleHandleW(L"hdtSMP64.dll");
         if (!mod) {
-            spdlog::info("FSMP: hdtSMP64.dll not loaded - SMP drive disabled.");
+            spdlog::info("FSMP: hdtSMP64.dll not loaded, SMP drive disabled.");
             return;
         }
 
@@ -146,8 +181,8 @@ namespace MTB::FsmpDrive {
         if (!build) {
             spdlog::error(
                 "FSMP: loaded hdtSMP64.dll is an unknown build (stamp 0x{:08X} size 0x{:X}). "
-                "SMP drive disabled - animation ticking still works. Known: SE 2.5.0, Slot 32 "
-                "Fix 1.1 (SE) + 1.6 (AE), AE 3.5.0 / 4.0.1 (all four CPU builds each). "
+                "SMP drive disabled, animation ticking still works. Known: SE 2.5.0, Slot 32 "
+                "Fix 1.1 (SE) + 1.6 (AE), AE 3.5.0 / 4.0.1 / 4.1.1 (all four CPU builds each). "
                 "Report this stamp/size and physics support can be added for your build.",
                 stamp, size);
             return;
@@ -161,7 +196,7 @@ namespace MTB::FsmpDrive {
         g_readTransform = build->readTransformRva
             ? reinterpret_cast<ReadTransformFn>(base + build->readTransformRva)
             : nullptr;
-        spdlog::info("FSMP: recognized {} - SMP drive armed (world @ {:p}).",
+        spdlog::info("FSMP: recognized {}, SMP drive armed (world @ {:p}).",
                      build->name, static_cast<void*>(g_world));
     }
 
@@ -231,7 +266,7 @@ namespace MTB::FsmpDrive {
         if (*resetPc != 0) {
             if (!g_resetPcLogged) {
                 g_resetPcLogged = true;
-                spdlog::debug("FSMP: player reset counter was {} - suppressed while armed "
+                spdlog::debug("FSMP: player reset counter was {}, suppressed while armed "
                               "(camera-state events must not reset menu physics).", *resetPc);
             }
             *resetPc = 0;
