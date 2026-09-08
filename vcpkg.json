@@ -1,13 +1,22 @@
 {
     "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
     "name": "menu-studio",
-    "version-string": "1.1.6",
-    "builtin-baseline": "fab1c6dc7a944372a90a1e19ab5e8e32cd658fc2",
+    "version-string": "1.1.6_NG",
     "dependencies": [
-        "commonlibsse-ng",
+        "catch2",
+        "directxmath",
+        "directxtk",
+        "zydis",
+        "zycore",
+        "fmt",
+        "nlohmann-json",
+        "rapidcsv",
+        "spdlog",
+        "toml11",
         "safetyhook",
         "xbyak",
         "simpleini",
+        "jsoncpp",
         "imgui"
     ],
     "overrides": [

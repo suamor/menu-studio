@@ -6,6 +6,15 @@ cmake_minimum_required(VERSION 3.21)
 # namespace is kept.)
 project(MenuStudio VERSION 1.1.6 LANGUAGES CXX)
 
+# Some versions of MSVC collide in own Windows headers with oder min/max declarations
+if (WIN32)
+    add_compile_definitions(NOMINMAX)
+endif()
+
+set(COMMONLIB_SSE_FOLDER ${CMAKE_CURRENT_SOURCE_DIR}/extern/src/CommonLibSSE-NG CACHE PATH "CommonLibSSE-NG source")
+add_subdirectory(${COMMONLIB_SSE_FOLDER} ${CMAKE_BINARY_DIR}/CommonLibSSE)
+include(${COMMONLIB_DIR}/cmake/CommonLibSSE.cmake)
+
 find_package(CommonLibSSE CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
 find_package(safetyhook CONFIG REQUIRED)
