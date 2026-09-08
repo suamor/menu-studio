@@ -13,7 +13,7 @@ endif()
 
 set(COMMONLIB_SSE_FOLDER ${CMAKE_CURRENT_SOURCE_DIR}/extern/src/CommonLibSSE-NG CACHE PATH "CommonLibSSE-NG source")
 add_subdirectory(${COMMONLIB_SSE_FOLDER} ${CMAKE_BINARY_DIR}/CommonLibSSE)
-include(${COMMONLIB_DIR}/cmake/CommonLibSSE.cmake)
+include(${COMMONLIB_SSE_FOLDER}/cmake/CommonLibSSE.cmake)
 
 find_package(CommonLibSSE CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
